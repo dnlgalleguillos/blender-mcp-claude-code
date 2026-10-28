@@ -41,6 +41,9 @@ uv run /ruta/absoluta/a/blender_mcp_server.py --check
 | `run_blender_script` | Ejecuta un `.py` de tu repo, con nombre de archivo y línea reales en los errores |
 | `save_blend`, `export_scene` | Guardar y exportar (`.glb .fbx .obj .stl .ply .usd`) a tu proyecto |
 | `polyhaven_*`, `sketchfab_*` | Búsqueda, vista previa e importación de assets |
+| `rodin_generate` | Genera un modelo 3D con Hyper3D Rodin (texto y/o imágenes de referencia) y lo importa |
+| `hunyuan3d_generate` | Genera un modelo 3D con Tencent Hunyuan3D (texto o imagen; API oficial o servidor local) |
+| `collect_generated_model` | Recoge e importa un trabajo de generación iniciado antes (o que agotó la espera) |
 
 También hay un recurso `blender://scene` y un prompt `blender_task` que arranca el flujo recomendado:
 mirar la escena, trabajar en pasos pequeños y verificar con capturas.
@@ -74,7 +77,13 @@ Se pasan con `-e` al registrar el servidor, por ejemplo `claude mcp add blender 
 ## Limitaciones conocidas
 
 - Blender ejecuta cada comando en su hilo de interfaz: renders, importaciones grandes y descargas lo congelan hasta terminar.
-- No incluye los generadores de IA (Hyper3D Rodin, Hunyuan3D); el add-on sí los soporta, falta añadir las herramientas.
+- Los generadores de IA **gastan créditos de tu cuenta** del proveedor y tardan minutos. Claude tiene instrucciones de
+  pedirte confirmación antes de la primera llamada. Los modelos generados llegan "crudos": escala y orientación
+  suelen requerir ajustes.
+- Hunyuan3D en modo **servidor local** es una sola petición síncrona: Blender queda congelado hasta que termina.
+- Rodin y Hunyuan3D se activan y configuran en el panel de Blender (casilla, plataforma y clave). Si falta algo,
+  la herramienta lo dice en lugar de fallar con un error críptico.
+- Las integraciones de generación se probaron contra respuestas simuladas de las APIs, no contra los servicios reales.
 
 ## Créditos y licencia
 

@@ -9,6 +9,10 @@
 #  - Default timeout on every HTTP request
 #  - Robust message framing (several/partial JSON messages per recv)
 #  - Proper logging, no bare excepts, start-up errors reported in the UI
+# 1.3.1:
+#  - Hunyuan3D local generation: long read timeout (it is one synchronous request that can take minutes)
+#  - Rodin images: [suffix, base64] items are sent as real image bytes (hyper3d.ai) or data URIs (fal.ai);
+#    plain URL strings keep working
 
 import re
 import bpy
@@ -39,7 +43,7 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 3),
+    "version": (1, 3, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -1234,6 +1238,28 @@ class BlenderMCPServer:
                             3. Restart the connection to Claude"""
             }
 
+    @staticmethod
+    def _rodin_image_bytes(item):
+        """(suffix, bytes) for a Rodin image given as [suffix, base64] or as an http(s) URL"""
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            suffix, b64 = item
+            return suffix, base64.b64decode(b64)
+        if isinstance(item, str) and re.match(r'^https?://', item, re.IGNORECASE):
+            response = _http_get(item)
+            response.raise_for_status()
+            suffix = osp.splitext(item.split("?")[0])[1] or ".jpg"
+            return suffix, response.content
+        raise ValueError("Each image must be [suffix, base64] or an http(s) URL")
+
+    @staticmethod
+    def _rodin_image_url(item):
+        """URL (or data URI) for a Rodin image, as fal.ai expects"""
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            suffix, b64 = item
+            mime = suffix.lstrip(".").lower().replace("jpg", "jpeg") or "png"
+            return f"data:image/{mime};base64,{b64}"
+        return item
+
     def create_rodin_job(self, *args, **kwargs):
         match bpy.context.scene.blendermcp_hyper3d_mode:
             case "MAIN_SITE":
@@ -1254,7 +1280,8 @@ class BlenderMCPServer:
                 images = []
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
-                *[("images", (f"{i:04d}{img_suffix}", img)) for i, (img_suffix, img) in enumerate(images)],
+                *[("images", (f"{i:04d}{suffix}", data))
+                  for i, (suffix, data) in enumerate(self._rodin_image_bytes(img) for img in images)],
                 ("tier", (None, "Sketch")),
                 ("mesh_mode", (None, "Raw")),
             ]
@@ -1285,7 +1312,7 @@ class BlenderMCPServer:
                 "tier": "Sketch",
             }
             if images:
-                req_data["input_image_urls"] = images
+                req_data["input_image_urls"] = [self._rodin_image_url(img) for img in images]
             if text_prompt:
                 req_data["prompt"] = text_prompt
             if bbox_condition:
@@ -2233,6 +2260,7 @@ class BlenderMCPServer:
             response = _http_post(
                 f"{base_url}/generate",
                 json = data,
+                timeout=(10, 1800),  # generation (and texturing) can take many minutes
             )
 
             if response.status_code != 200:

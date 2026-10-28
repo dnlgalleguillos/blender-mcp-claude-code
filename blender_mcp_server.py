@@ -14,6 +14,7 @@ and exposes it as MCP tools. Compared with a thin "execute code" bridge it adds:
   * run_blender_script: execute a .py file from your repo with real file names in tracebacks
   * save / export helpers that write into your project
   * Poly Haven and Sketchfab asset tools (results trimmed to what matters)
+  * AI text/image-to-3D: Hyper3D Rodin (hyper3d.ai, fal.ai) and Hunyuan3D (Tencent cloud, local server)
   * a persistent connection with stale-socket detection, deadlines and no unsafe retries
   * optional shared-token auth and a read-only mode
 
@@ -33,6 +34,7 @@ import base64
 import json
 import logging
 import os
+import re
 import select
 import socket
 import sys
@@ -44,7 +46,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 import anyio
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -280,6 +282,9 @@ Working method:
 7. execute_blender_code and run_blender_script can do anything Python can. Never delete user data, quit
    Blender, or overwrite files you were not asked to touch. Call save_blend only when the user wants it.
 8. File paths are resolved on the machine running Blender; relative paths resolve against the project.
+9. rodin_generate and hunyuan3d_generate spend the user's API credits and can take minutes: confirm with the
+   user before the first call. Generated meshes are raw: check scale and orientation with get_object_details
+   (generators rarely produce real-world sizes) and clean up before building on them.
 """
 
 mcp = FastMCP("blender", instructions=INSTRUCTIONS)
@@ -882,6 +887,257 @@ async def sketchfab_download(
                         {"uid": uid, "normalize_size": normalize_size, "target_size": target_size},
                         timeout=timeout_s, integration="Sketchfab")
     return _compact(result)
+
+
+# --------------------------------------------------------------------------- tools: AI 3D generation
+#
+# Generation is asynchronous on the provider side. The tools hide the differences between Hyper3D Rodin
+# (hyper3d.ai / fal.ai) and Hunyuan3D (Tencent cloud / local server) behind an opaque job handle:
+#   rodin|main|<subscription_key>|<uuid>     rodin|fal|<request_id>     hunyuan|<job_id>
+
+RODIN_POLL_SECONDS = 8
+HUNYUAN_POLL_SECONDS = 10
+
+SNIP_OBJECT_NAMES = """
+print(json.dumps(list(bpy.data.objects.keys())))
+"""
+
+SNIP_RENAME_ROOT = """
+names = _P["names"]
+objs = [bpy.data.objects[n] for n in names if n in bpy.data.objects]
+roots = [o for o in objs if o.parent is None or o.parent.name not in names]
+root = None
+if len(roots) == 1:
+    roots[0].name = _P["name"]
+    root = roots[0].name
+print(json.dumps({"root": root, "new_objects": [o.name for o in objs]}))
+"""
+
+
+def _msg(text: Any) -> str:
+    return " ".join(str(text).split())
+
+
+async def _require_ready(status_command: str, label: str) -> dict:
+    """The add-on reports whether an integration is enabled and configured (API key, URL...)."""
+    status = await call(status_command)
+    if not isinstance(status, dict) or not status.get("enabled"):
+        detail = _msg(status.get("message", "")) if isinstance(status, dict) else ""
+        raise ToolError(f"{label} is not ready: {detail}")
+    return status
+
+
+def _is_url(text: str) -> bool:
+    return re.match(r"^https?://", text, re.IGNORECASE) is not None
+
+
+def _encode_images(paths: Optional[list[str]], urls: Optional[list[str]]) -> list:
+    """Local files become [suffix, base64]; URLs stay strings. The add-on adapts them to each platform."""
+    items: list = []
+    for p in paths or []:
+        f = _path(p)
+        try:
+            data = f.read_bytes()
+        except OSError as e:
+            raise ToolError(f"Cannot read image {f}: {e}") from None
+        if len(data) > 10 * 1024 * 1024:
+            raise ToolError(f"Image {f.name} is larger than 10 MB; downscale it first")
+        items.append([f.suffix.lower() or ".png", base64.b64encode(data).decode("ascii")])
+    for u in urls or []:
+        if not _is_url(u):
+            raise ToolError(f"Not an http(s) URL: {u}")
+        items.append(u)
+    return items
+
+
+def _rodin_job(created: Any) -> str:
+    if isinstance(created, dict):
+        if created.get("request_id"):
+            return f"rodin|fal|{created['request_id']}"
+        jobs = created.get("jobs") or {}
+        if created.get("uuid") and isinstance(jobs, dict) and jobs.get("subscription_key"):
+            return f"rodin|main|{jobs['subscription_key']}|{created['uuid']}"
+    raise ToolError("Unexpected response from Rodin when creating the job (check the API key and credits): "
+                    + _compact(created)[:500])
+
+
+def _tencent_error(resp: dict) -> Optional[ToolError]:
+    err = resp.get("Error")
+    if err:
+        return ToolError(f"Hunyuan3D API error {err.get('Code')}: {err.get('Message')}")
+    return None
+
+
+async def _progress(ctx: Optional[Context], elapsed: float, total: float) -> None:
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(min(elapsed, total), total)
+    except Exception:  # progress is best-effort, never fail a job because of it
+        pass
+
+
+async def _poll_job(kind: str, parts: list[str]) -> tuple[str, Any]:
+    """Returns (state, detail) with state in running / done / failed."""
+    valid = ((kind == "rodin" and parts[:1] == ["main"] and len(parts) == 3)
+             or (kind == "rodin" and parts[:1] == ["fal"] and len(parts) == 2)
+             or (kind == "hunyuan" and len(parts) == 1))
+    if not valid:
+        raise ToolError("Invalid job handle. Pass the 'job' value returned by rodin_generate / hunyuan3d_generate unchanged.")
+    try:
+        if kind == "rodin" and parts[0] == "main":
+            data = await call("poll_rodin_job_status", {"subscription_key": parts[1]}, integration="Hyper3D Rodin")
+            statuses = data.get("status_list") if isinstance(data, dict) else None
+            if not statuses:
+                raise ToolError(f"unexpected status reply: {_compact(data)[:300]}")
+            if any(st == "Failed" for st in statuses):
+                return "failed", statuses
+            return ("done" if all(st == "Done" for st in statuses) else "running"), statuses
+        if kind == "rodin":
+            data = await call("poll_rodin_job_status", {"request_id": parts[1]}, integration="Hyper3D Rodin")
+            status = data.get("status") if isinstance(data, dict) else None
+            if status == "COMPLETED":
+                return "done", data
+            if status in ("IN_QUEUE", "IN_PROGRESS"):
+                return "running", {k: data[k] for k in ("status", "queue_position") if k in data}
+            return "failed", data
+        data = await call("poll_hunyuan_job_status", {"job_id": parts[0]}, integration="Hunyuan3D")
+        resp = data.get("Response") if isinstance(data, dict) else None
+        if not isinstance(resp, dict):
+            raise ToolError(f"unexpected status reply: {_compact(data)[:300]}")
+        if (err := _tencent_error(resp)) is not None:
+            raise err
+        status = resp.get("Status")
+        if status == "DONE":
+            return "done", resp
+        if status == "FAIL":
+            return "failed", resp.get("ErrorMessage") or resp
+        return "running", {"status": status}
+    except ToolError as e:
+        raise ToolError(f"Status check failed: {e}. Check the job handle, API key and credits.") from None
+
+
+async def _import_job(kind: str, parts: list[str], name: str, detail: Any) -> Any:
+    if kind == "rodin":
+        params = ({"task_uuid": parts[2], "name": name} if parts[0] == "main"
+                  else {"request_id": parts[1], "name": name})
+        return await call("import_generated_asset", params, timeout=180, integration="Hyper3D Rodin")
+    files = detail.get("ResultFile3Ds") or []
+    chosen = next((f for f in files if str(f.get("Type", "")).upper() == "OBJ"), files[0] if files else None)
+    if not chosen or not chosen.get("Url"):
+        raise ToolError("Hunyuan3D finished but returned no downloadable file: " + _compact(detail)[:400])
+    return await call("import_generated_asset_hunyuan", {"name": name, "zip_file_url": chosen["Url"]},
+                      timeout=240, integration="Hunyuan3D")
+
+
+async def _collect(ctx: Optional[Context], job: str, name: str, wait: bool, timeout_s: float) -> str:
+    kind, *parts = job.split("|")
+    interval = RODIN_POLL_SECONDS if kind == "rodin" else HUNYUAN_POLL_SECONDS
+    started = time.monotonic()
+    deadline = started + (timeout_s if wait else 0)
+    while True:
+        state, detail = await _poll_job(kind, parts)
+        if state == "done":
+            break
+        if state == "failed":
+            raise ToolError(f"Generation failed: {_compact(detail)[:500]}")
+        if time.monotonic() >= deadline:
+            return _compact({"state": "running", "detail": detail, "job": job,
+                             "next": "Call collect_generated_model with this job later (wait=true) to import it."})
+        await _progress(ctx, time.monotonic() - started, timeout_s)
+        await anyio.sleep(interval)
+    imported = await _import_job(kind, parts, name, detail)
+    return _compact({"state": "imported", "result": imported})
+
+
+@_tool(read_only=False, destructive=False, open_world=True)
+async def rodin_generate(
+    ctx: Context,
+    prompt: Annotated[Optional[str], Field(description="Text description of the object (English works best)")] = None,
+    image_paths: Annotated[Optional[list[str]], Field(description="Reference image files; relative paths resolve against the project")] = None,
+    image_urls: Annotated[Optional[list[str]], Field(description="Reference images as http(s) URLs")] = None,
+    bbox_condition: Annotated[Optional[list[float]], Field(description="Optional bounding-box proportions [x, y, z], e.g. [1, 1, 2] for twice as tall as wide")] = None,
+    name: Annotated[str, Field(description="Name for the imported object")] = "rodin_model",
+    wait: Annotated[bool, Field(description="Wait for the result and import it. If false, returns a job handle immediately")] = True,
+    timeout_s: Annotated[float, Field(ge=10, le=3600, description="Maximum time to wait for the generation")] = 600,
+) -> str:
+    """Generate a 3D model with Hyper3D Rodin from a text prompt and/or reference images and import it into
+    the scene. CONSUMES the user's Rodin credits (the shared free-trial key is heavily rate-limited), so
+    confirm before calling. Generation takes a few minutes; if the wait times out you get a job handle to
+    pass to collect_generated_model. Needs 'Use Hyper3D Rodin' enabled and a key in the BlenderMCP panel.
+    The mesh is raw: check its scale and orientation afterwards."""
+    if not prompt and not image_paths and not image_urls:
+        raise ToolError("Provide a prompt and/or reference images")
+    await _require_ready("get_hyper3d_status", "Hyper3D Rodin")
+    images = _encode_images(image_paths, image_urls)
+    created = await call("create_rodin_job",
+                         {"text_prompt": prompt, "images": images or None, "bbox_condition": bbox_condition},
+                         timeout=120, integration="Hyper3D Rodin")
+    return await _collect(ctx, _rodin_job(created), name, wait, timeout_s)
+
+
+@_tool(read_only=False, destructive=False, open_world=True)
+async def hunyuan3d_generate(
+    ctx: Context,
+    prompt: Annotated[Optional[str], Field(description="Text description (official API: max 200 characters)")] = None,
+    image: Annotated[Optional[str], Field(description="Reference image: file path (relative to the project) or http(s) URL")] = None,
+    name: Annotated[str, Field(description="Name for the imported object")] = "hunyuan_model",
+    wait: Annotated[bool, Field(description="Official API only: wait for the result and import it, or return a job handle")] = True,
+    timeout_s: Annotated[float, Field(ge=10, le=7200, description="Maximum time to wait for the generation")] = 900,
+) -> str:
+    """Generate a 3D model with Tencent Hunyuan3D from text or an image and import it into the scene.
+    Works with the mode chosen in the BlenderMCP panel. Official API: exactly one of prompt / image; it is
+    asynchronous and CONSUMES the user's Tencent credits, so confirm before calling. Local server: runs
+    synchronously and Blender is FROZEN until it finishes (can take minutes; shape and texture settings come
+    from the panel); the imported root object is renamed to 'name' when it can be identified."""
+    status = await _require_ready("get_hunyuan3d_status", "Hunyuan3D")
+    if not prompt and not image:
+        raise ToolError("Provide a prompt or an image")
+    img = (image if _is_url(image) else str(_path(image))) if image else None
+
+    if status.get("mode") == "OFFICIAL_API":
+        if prompt and image:
+            raise ToolError("The official Hunyuan3D API accepts either a prompt or an image, not both")
+        if prompt and len(prompt) > 200:
+            raise ToolError("The official Hunyuan3D API limits prompts to 200 characters")
+        created = await call("create_hunyuan_job", {"text_prompt": prompt, "image": img},
+                             timeout=120, integration="Hunyuan3D")
+        resp = created.get("Response") if isinstance(created, dict) else None
+        if not isinstance(resp, dict):
+            raise ToolError("Unexpected response from Hunyuan3D when creating the job: " + _compact(created)[:500])
+        if (err := _tencent_error(resp)) is not None:
+            raise err
+        if not resp.get("JobId"):
+            raise ToolError("Hunyuan3D returned no JobId: " + _compact(resp)[:500])
+        return await _collect(ctx, f"hunyuan|{resp['JobId']}", name, wait, timeout_s)
+
+    # Local server: one blocking request; the add-on imports the GLB on Blender's next timer tick.
+    before = set(await _query(SNIP_OBJECT_NAMES))
+    await call("create_hunyuan_job", {"text_prompt": prompt, "image": img}, timeout=timeout_s, integration="Hunyuan3D")
+    new: list[str] = []
+    for _ in range(30):  # the import runs asynchronously; wait until the new objects stop appearing
+        await anyio.sleep(0.5)
+        names = [n for n in await _query(SNIP_OBJECT_NAMES) if n not in before]
+        if names and names == new:
+            break
+        new = names
+    if not new:
+        raise ToolError("Hunyuan3D reported success but no new objects appeared in the scene")
+    info = await _query(SNIP_RENAME_ROOT, {"names": new, "name": name})
+    return _compact({"state": "imported", "result": info})
+
+
+@_tool(read_only=False, destructive=False, open_world=True)
+async def collect_generated_model(
+    ctx: Context,
+    job: Annotated[str, Field(description="The 'job' handle returned by rodin_generate or hunyuan3d_generate, unchanged")],
+    name: Annotated[str, Field(description="Name for the imported object")] = "generated_model",
+    wait: Annotated[bool, Field(description="Keep waiting until done (up to timeout_s). If false, check once and return")] = True,
+    timeout_s: Annotated[float, Field(ge=10, le=3600)] = 600,
+) -> str:
+    """Check a generation job started earlier (rodin_generate / hunyuan3d_generate with wait=false, or one
+    that timed out) and import the model once it is ready. Safe to call repeatedly while it is running."""
+    return await _collect(ctx, job, name, wait, timeout_s)
 
 
 # --------------------------------------------------------------------------- prompt
