@@ -82,4 +82,4 @@ Se pasan con `-e` al registrar el servidor, por ejemplo `claude mcp add blender 
   (© 2025 Siddharth Ahuja, licencia MIT). Su aviso de copyright y licencia están en
   [`LICENSE-blender-mcp.txt`](LICENSE-blender-mcp.txt). Los cambios respecto al original están listados en la
   cabecera del archivo.
-- `blender_mcp_server.py` y este README son de este repositorio.
+- `blender_mcp_server.py` y este README se publican bajo licencia MIT, ver [`LICENSE`](LICENSE) (© 2026 Daniel Galleguillos Cruz).
