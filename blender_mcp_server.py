@@ -1,6 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # Code created by Daniel Galleguillos: https://github.com/dnlgalleguillos
-# License: MIT © 2026 (see LICENSE)
+# Copyright (C) 2026 Daniel Galleguillos Cruz
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. It is distributed WITHOUT ANY WARRANTY; see the
+# GNU General Public License (file LICENSE) for details.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["mcp>=1.10,<2"]

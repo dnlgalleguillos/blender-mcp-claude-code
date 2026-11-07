@@ -86,7 +86,11 @@ Pass them with `-e` when registering the server, for example `claude mcp add ble
 
 ## Credits and license
 
+- `blender_mcp_server.py`, this README and all modifications to the add-on are free software under the
+  **GNU General Public License, version 3 or (at your option) any later version**, see [`LICENSE`](LICENSE).
+  Copyright (C) 2026 Daniel Galleguillos Cruz.
 - `blender_mcp.py` is a modified version of the add-on from [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp)
-  (© 2025 Siddharth Ahuja, MIT License). Its copyright and license notice are in
-  [`LICENSE-blender-mcp.txt`](LICENSE-blender-mcp.txt). The changes from the original are listed in the file header.
-- `blender_mcp_server.py` and this README are published under the MIT license, see [`LICENSE`](LICENSE) (© 2026 Daniel Galleguillos Cruz).
+  (© 2025 Siddharth Ahuja, MIT License). The original portions keep their MIT license and the original copyright and
+  license notice are preserved in [`LICENSE-blender-mcp.txt`](LICENSE-blender-mcp.txt); the MIT license is
+  GPL-compatible, so the file as a whole is distributed under the GPL with that notice kept. The changes from the
+  original are listed in the file header.

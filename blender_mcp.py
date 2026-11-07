@@ -1,5 +1,8 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
 # Original project: https://github.com/ahujasid/blender-mcp (MIT License, see LICENSE-blender-mcp.txt)
+# Modifications: Copyright (C) 2026 Daniel Galleguillos Cruz (https://github.com/dnlgalleguillos),
+#   licensed under GPL-3.0-or-later (see LICENSE). The original MIT-licensed portions keep their MIT license.
+# SPDX-License-Identifier: MIT AND GPL-3.0-or-later
 #
 # Modified version (1.3). Changes vs. 1.2:
 #  - Removed the handler that deleted the object named "Cube" on every file load
