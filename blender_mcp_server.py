@@ -12,7 +12,7 @@
 # dependencies = ["mcp>=1.10,<2"]
 # ///
 """
-Blender MCP server, designed for Claude Code.
+Blender MCP server, designed for Claude Code and Daniel Galleguillos Cruz.
 
 Speaks the TCP/JSON protocol of the BlenderMCP add-on (blender_mcp.py, v1.3 or the stock add-on)
 and exposes it as MCP tools. Compared with a thin "execute code" bridge it adds:
