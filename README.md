@@ -1,94 +1,92 @@
 # Blender + Claude Code (MCP)
 
-Dos archivos:
+Control Blender from Claude Code. Two files:
 
-| Archivo | Dónde corre | Qué hace |
+| File | Runs where | What it does |
 |---|---|---|
-| `blender_mcp.py` | Dentro de Blender (add-on) | Abre un socket local y ejecuta los comandos en Blender |
-| `blender_mcp_server.py` | Lo lanza Claude Code | Servidor MCP: expone las herramientas a Claude y habla con el add-on |
+| `blender_mcp.py` | Inside Blender (add-on) | Opens a local socket and executes commands in Blender |
+| `blender_mcp_server.py` | Launched by Claude Code | MCP server: exposes the tools to Claude and talks to the add-on |
 
 ```
 Claude Code ──MCP/stdio──► blender_mcp_server.py ──TCP 127.0.0.1:9876──► blender_mcp.py (Blender)
 ```
 
-## Instalación
+## Installation
 
-1. **Add-on:** Blender > Edit > Preferences > Add-ons > Install > `blender_mcp.py` (desinstala antes cualquier versión anterior) y actívalo.
-2. **Conectar:** en la vista 3D pulsa `N` > pestaña **BlenderMCP** > **Connect to MCP server**.
-3. **Servidor en Claude Code** (necesita [uv](https://docs.astral.sh/uv/); instala las dependencias solo). Sustituye la ruta por la de tu copia del repositorio:
-
-```bash
-claude mcp add blender -- uv run /ruta/absoluta/a/blender_mcp_server.py
-```
-
-4. Comprueba la conexión (con Blender abierto y conectado):
+1. **Add-on:** Blender > Edit > Preferences > Add-ons > Install > `blender_mcp.py` (uninstall any previous version first), then enable it.
+2. **Connect:** in the 3D viewport press `N` > **BlenderMCP** tab > **Connect to MCP server**.
+3. **Server in Claude Code** (requires [uv](https://docs.astral.sh/uv/); it installs the dependencies by itself). Replace the path with the location of your copy of the repository:
 
 ```bash
-uv run /ruta/absoluta/a/blender_mcp_server.py --check
+claude mcp add blender -- uv run /absolute/path/to/blender_mcp_server.py
 ```
 
-## Herramientas
+4. Check the connection (with Blender open and connected):
 
-| Herramienta | Para qué |
+```bash
+uv run /absolute/path/to/blender_mcp_server.py --check
+```
+
+## Tools
+
+| Tool | Purpose |
 |---|---|
-| `blender_status` | Diagnóstico: conexión, versión, archivo, si el código está permitido |
-| `scene_overview` | Resumen de escena: render, unidades, conteo por tipo, colecciones, selección |
-| `list_objects` | Objetos con filtros (tipo, nombre, colección, selección) y paginación |
-| `get_object_details` | Estado completo de un objeto: transformación, modificadores, materiales, malla, cámara, luz |
-| `viewport_screenshot` | Captura del viewport como imagen para que Claude verifique su trabajo |
-| `render_image` | Render a archivo (restaura los ajustes de la escena al terminar) |
-| `execute_blender_code` | Python corto dentro de Blender (crea un paso de Ctrl+Z antes) |
-| `run_blender_script` | Ejecuta un `.py` de tu repo, con nombre de archivo y línea reales en los errores |
-| `save_blend`, `export_scene` | Guardar y exportar (`.glb .fbx .obj .stl .ply .usd`) a tu proyecto |
-| `polyhaven_*`, `sketchfab_*` | Búsqueda, vista previa e importación de assets |
-| `rodin_generate` | Genera un modelo 3D con Hyper3D Rodin (texto y/o imágenes de referencia) y lo importa |
-| `hunyuan3d_generate` | Genera un modelo 3D con Tencent Hunyuan3D (texto o imagen; API oficial o servidor local) |
-| `collect_generated_model` | Recoge e importa un trabajo de generación iniciado antes (o que agotó la espera) |
+| `blender_status` | Diagnostics: connection, version, open file, whether code execution is allowed |
+| `scene_overview` | Scene summary: render settings, units, counts by type, collections, selection |
+| `list_objects` | Objects with filters (type, name, collection, selection) and pagination |
+| `get_object_details` | Full state of one object: transform, modifiers, materials, mesh, camera, light |
+| `viewport_screenshot` | Viewport capture returned as an image so Claude can check its own work |
+| `render_image` | Render to a file (scene render settings are restored afterwards) |
+| `execute_blender_code` | Short Python snippets inside Blender (creates a Ctrl+Z undo step first) |
+| `run_blender_script` | Run a `.py` file from your repo, with real file names and line numbers in errors |
+| `save_blend`, `export_scene` | Save and export (`.glb .fbx .obj .stl .ply .usd`) into your project |
+| `polyhaven_*`, `sketchfab_*` | Search, preview and import assets |
+| `rodin_generate` | Generate a 3D model with Hyper3D Rodin (text and/or reference images) and import it |
+| `hunyuan3d_generate` | Generate a 3D model with Tencent Hunyuan3D (text or image; official API or local server) |
+| `collect_generated_model` | Fetch and import a generation job started earlier (or one whose wait timed out) |
 
-También hay un recurso `blender://scene` y un prompt `blender_task` que arranca el flujo recomendado:
-mirar la escena, trabajar en pasos pequeños y verificar con capturas.
+There is also a `blender://scene` resource and a `blender_task` prompt that starts the recommended workflow:
+look at the scene, work in small steps, and verify with screenshots.
 
-**Flujo recomendado en Claude Code:** pídele que escriba scripts en tu repo (`scenes/rocas.py`) y los ejecute con
-`run_blender_script`. El código queda versionado en git y se puede editar y volver a lanzar.
+**Recommended workflow in Claude Code:** ask it to write scripts in your repo (`scenes/rocks.py`) and run them with
+`run_blender_script`. The code stays under version control and can be edited and re-run.
 
-## Configuración (variables de entorno)
+## Configuration (environment variables)
 
-Se pasan con `-e` al registrar el servidor, por ejemplo `claude mcp add blender -e BLENDER_PORT=9999 -- uv run ...`.
+Pass them with `-e` when registering the server, for example `claude mcp add blender -e BLENDER_PORT=9999 -- uv run ...`.
 
-| Variable | Por defecto | |
+| Variable | Default | |
 |---|---|---|
-| `BLENDER_HOST` / `BLENDER_PORT` | `127.0.0.1` / `9876` | Debe coincidir con el puerto del panel |
-| `BLENDER_MCP_TOKEN` | vacío | Mismo valor que "Auth Token" en las preferencias del add-on |
-| `BLENDER_TIMEOUT` | `30` | Segundos por comando (cada herramienta larga acepta `timeout_s`) |
-| `BLENDER_MCP_READONLY` | desactivado | `1` = no registra las herramientas que modifican la escena o escriben archivos |
-| `BLENDER_MCP_LOG` | `INFO` | Los logs van a stderr |
+| `BLENDER_HOST` / `BLENDER_PORT` | `127.0.0.1` / `9876` | Must match the port in the Blender panel |
+| `BLENDER_MCP_TOKEN` | empty | Same value as "Auth Token" in the add-on preferences |
+| `BLENDER_TIMEOUT` | `30` | Seconds per command (long-running tools accept `timeout_s`) |
+| `BLENDER_MCP_READONLY` | off | `1` = do not register tools that modify the scene or write files |
+| `BLENDER_MCP_LOG` | `INFO` | Logs go to stderr |
 
-## Seguridad
+## Security
 
-- El socket solo escucha en `localhost`. Con token configurado, cada comando debe llevarlo (se compara en tiempo constante).
-- `execute_blender_code` y `run_blender_script` ejecutan Python arbitrario con tus permisos. Puedes apagarlos con
-  **Allow code execution** en el panel de Blender. Las herramientas de inspección también lo usan, así que con eso
-  apagado solo funcionan el resumen básico, las capturas y los assets.
-- `BLENDER_MCP_READONLY=1` es una comodidad para que Claude no vea las herramientas de escritura, **no** un sandbox:
-  el límite real es el interruptor del panel.
-- Las rutas se resuelven en la máquina de Blender. Si Claude Code corre en otra (contenedor, WSL), las capturas y
-  exportaciones necesitan un sistema de archivos compartido.
+- The socket only listens on `localhost`. With a token configured, every command must carry it (compared in constant time).
+- `execute_blender_code` and `run_blender_script` run arbitrary Python with your permissions. You can turn them off with
+  **Allow code execution** in the Blender panel. The inspection tools use it too, so with it off only the basic
+  summary, screenshots and assets keep working.
+- `BLENDER_MCP_READONLY=1` is a convenience so Claude does not see the write tools, **not** a sandbox:
+  the real boundary is the switch in the panel.
+- Paths are resolved on the machine running Blender. If Claude Code runs on a different one (container, WSL), screenshots
+  and exports need a shared filesystem.
 
-## Limitaciones conocidas
+## Known limitations
 
-- Blender ejecuta cada comando en su hilo de interfaz: renders, importaciones grandes y descargas lo congelan hasta terminar.
-- Los generadores de IA **gastan créditos de tu cuenta** del proveedor y tardan minutos. Claude tiene instrucciones de
-  pedirte confirmación antes de la primera llamada. Los modelos generados llegan "crudos": escala y orientación
-  suelen requerir ajustes.
-- Hunyuan3D en modo **servidor local** es una sola petición síncrona: Blender queda congelado hasta que termina.
-- Rodin y Hunyuan3D se activan y configuran en el panel de Blender (casilla, plataforma y clave). Si falta algo,
-  la herramienta lo dice en lugar de fallar con un error críptico.
-- Las integraciones de generación se probaron contra respuestas simuladas de las APIs, no contra los servicios reales.
+- Blender runs every command on its UI thread: renders, large imports and downloads freeze it until they finish.
+- The AI generators **spend credits on your provider account** and take minutes. Claude is instructed to ask for your
+  confirmation before the first call. Generated models arrive "raw": scale and orientation usually need adjusting.
+- Hunyuan3D in **local server** mode is a single synchronous request: Blender stays frozen until it finishes.
+- Rodin and Hunyuan3D are enabled and configured in the Blender panel (checkbox, platform and key). If something is
+  missing, the tool says so instead of failing with a cryptic error.
+- The generation integrations were tested against simulated API responses, not against the real services.
 
-## Créditos y licencia
+## Credits and license
 
-- `blender_mcp.py` es una versión modificada del add-on de [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp)
-  (© 2025 Siddharth Ahuja, licencia MIT). Su aviso de copyright y licencia están en
-  [`LICENSE-blender-mcp.txt`](LICENSE-blender-mcp.txt). Los cambios respecto al original están listados en la
-  cabecera del archivo.
-- `blender_mcp_server.py` y este README se publican bajo licencia MIT, ver [`LICENSE`](LICENSE) (© 2026 Daniel Galleguillos Cruz).
+- `blender_mcp.py` is a modified version of the add-on from [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp)
+  (© 2025 Siddharth Ahuja, MIT License). Its copyright and license notice are in
+  [`LICENSE-blender-mcp.txt`](LICENSE-blender-mcp.txt). The changes from the original are listed in the file header.
+- `blender_mcp_server.py` and this README are published under the MIT license, see [`LICENSE`](LICENSE) (© 2026 Daniel Galleguillos Cruz).

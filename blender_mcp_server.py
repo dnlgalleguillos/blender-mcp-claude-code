@@ -1,4 +1,6 @@
 #!/usr/bin/env -S uv run --script
+# Code created by Daniel Galleguillos: https://github.com/dnlgalleguillos
+# License: MIT © 2026 (see LICENSE)
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["mcp>=1.10,<2"]
