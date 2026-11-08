@@ -7,10 +7,10 @@ Needs the `bpy` module (Blender as a Python library), whose wheels target Python
 
     uv run --no-project --python 3.11 --with bpy --with "mcp>=1.10,<2" --with httpx python -I tests/test_blender.py
 
-Why a harness is needed: the add-on hands every command to Blender's main thread with bpy.app.timers, but a
+Why a harness is needed: the add-on runs commands on Blender's main thread from a bpy.app.timers callback, but a
 headless `bpy` module has no event loop, so timers never fire. The add-on's `bpy` is therefore replaced by a thin
-proxy whose `app.timers.register` queues the callbacks, and the main thread runs them while the async tests run in
-a worker thread.
+proxy whose `app.timers` just remembers the callbacks; the main thread calls them in a loop (honouring "return None
+= unregister") while the async tests run in a worker thread. bpy.ops must only ever run on the main thread.
 """
 import asyncio
 import importlib.util
@@ -25,7 +25,7 @@ import bpy
 
 ROOT = Path(__file__).resolve().parent.parent
 _results = {"ok": True, "pass": 0, "fail": 0, "skip": 0}
-_queue: list = []
+_callbacks: list = []
 
 
 def load_module(name: str, path: Path):
@@ -38,7 +38,16 @@ def load_module(name: str, path: Path):
 class _Timers:
     @staticmethod
     def register(fn, first_interval=0.0, persistent=False):
-        _queue.append(fn)
+        _callbacks.append(fn)
+
+    @staticmethod
+    def unregister(fn):
+        if fn in _callbacks:
+            _callbacks.remove(fn)
+
+    @staticmethod
+    def is_registered(fn):
+        return fn in _callbacks
 
 
 class _App:
@@ -60,22 +69,19 @@ class _BpyProxy:
 
 
 def load_addon():
-    """The add-on module, registered, with its timers routed to this harness.
-
-    BLENDER_MCP_ADDON=/path/to/other_addon.py runs the same tests against a different add-on (for example the stock
-    blender-mcp one) to check compatibility."""
-    addon = load_module("blender_mcp_addon", Path(os.environ.get("BLENDER_MCP_ADDON") or ROOT / "blender_mcp.py"))
+    """The add-on module, registered, with its timers routed to this harness."""
+    addon = load_module("blender_mcp_addon", ROOT / "blender_mcp.py")
     addon.bpy = _BpyProxy(bpy)
     addon.register()
-    if hasattr(addon, "log"):
-        addon.log.setLevel(40)
+    addon.log.setLevel(40)
     return addon
 
 
 def load_server(port: int, **env):
     """A fresh copy of the MCP server module configured through the same environment variables a user sets."""
-    keys = ("BLENDER_PORT", "BLENDER_MCP_TOKEN", "BLENDER_MCP_READONLY", "BLENDER_MCP_SAFE_MODE",
-            "POLYPIZZA_API_KEY", "BLENDER_TIMEOUT")
+    keys = ("BLENDER_PORT", "BLENDER_MCP_TOKEN", "BLENDER_MCP_READONLY", "BLENDER_MCP_SAFE_MODE", "BLENDER_TIMEOUT",
+            "POLYPIZZA_API_KEY", "SKETCHFAB_API_KEY", "HYPER3D_API_KEY", "HYPER3D_PLATFORM", "HUNYUAN3D_SECRET_ID",
+            "HUNYUAN3D_SECRET_KEY", "HUNYUAN3D_API_URL", "HUNYUAN3D_MODE")
     for k in keys:
         os.environ.pop(k, None)
     os.environ["BLENDER_PORT"] = str(port)
@@ -99,9 +105,10 @@ def run(async_main):
 
     threading.Thread(target=worker, daemon=True).start()
     while not done.is_set():
-        while _queue:
-            _queue.pop(0)()
-        time.sleep(0.002)
+        for fn in list(_callbacks):
+            if fn() is None and fn in _callbacks:
+                _callbacks.remove(fn)
+        time.sleep(0.001)
     if "error" in box:
         check("test run finished without an unexpected exception", False, repr(box["error"]))
 

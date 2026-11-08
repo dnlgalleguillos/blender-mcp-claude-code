@@ -132,16 +132,23 @@ addon = h.load_addon()
 
 async def main():
     port = 19970
-    srv = addon.BlenderMCPServer(port=port)
-    srv.start()
-    assert srv.running, "the add-on socket did not start"
+    srv = addon.Bridge(port=port)
+    assert srv.start(), "the add-on socket did not start"
     S = h.load_server(port)
     sc = bpy.context.scene
 
     # ------------------------------------------------------------------ status
     d = json.loads(await S.blender_status())
     check("blender_status reports real Blender 5.x and code execution", d["blender_version"].startswith("5.")
-          and d["code_execution"] == "enabled" and d["safe_mode"] is False, d)
+          and d["code_execution"] is True and d["safe_mode"] is False and d["protocol"] == 2
+          and d["addon"] == "blender-mcp-bridge" and d["libraries"]["polyhaven"].startswith("ready") and d["generators"] == {"hyper3d_rodin": False, "hunyuan3d": False}, d)
+    wm = bpy.context.window_manager
+    wm.blendermcp_allow_code = False
+    d = json.loads(await S.blender_status())
+    check("status still works with code execution switched off, and says so", d["code_execution"] is False, d)
+    r = await raises(S.get_scene_info(), "allow code execution")
+    check("with the panel switch off, tools that need code say how to turn it on", r[0], r[1])
+    wm.blendermcp_allow_code = True
 
     # ------------------------------------------------------------------ get_scene_info
     out = await S.get_scene_info()

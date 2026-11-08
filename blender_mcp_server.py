@@ -14,8 +14,9 @@
 """
 Blender MCP server 2.0, designed for Claude Code and Daniel Galleguillos Cruz.
 
-Speaks the TCP/JSON protocol of the BlenderMCP add-on (blender_mcp.py 1.3.2 or the stock add-on) and exposes
-it as MCP tools. What it adds over a thin "execute code" bridge:
+Talks to the Blender MCP Bridge add-on (blender_mcp.py 2.x, in this repository) over a local socket and exposes
+Blender as MCP tools. The add-on only runs code and takes screenshots; everything else, including all network
+access and API keys, lives here. What this server provides:
 
   * get_scene_info: compact text facts about the scene, with mesh/rig "health" checks and ground contact
   * look: the live viewport, the scene camera, auto-framed multi-angle views and animation strips as images,
@@ -38,6 +39,10 @@ Configuration (environment variables):
   BLENDER_MCP_READONLY    1 = do not register tools that modify the scene or write files
   BLENDER_MCP_SAFE_MODE   1 = validate model-written Python before it reaches Blender (see "safe mode")
   POLYPIZZA_API_KEY       free key from poly.pizza/settings/api, to search and import Poly Pizza models
+  SKETCHFAB_API_KEY       Sketchfab API token (search and import; Poly Haven needs no key)
+  HYPER3D_API_KEY         Hyper3D Rodin key; HYPER3D_PLATFORM=fal to use fal.ai instead of hyper3d.ai
+  HUNYUAN3D_SECRET_ID / HUNYUAN3D_SECRET_KEY   Tencent Cloud credentials for the official Hunyuan3D API
+  HUNYUAN3D_API_URL       your own Hunyuan3D server, e.g. http://localhost:8081 (HUNYUAN3D_MODE=official|local to force)
   BLENDER_MCP_LOG         logging level (default INFO); logs go to stderr, never stdout
 
 Diagnostics:  uv run blender_mcp_server.py --check
@@ -45,7 +50,11 @@ Diagnostics:  uv run blender_mcp_server.py --check
 
 import argparse
 import ast
+import asyncio
 import base64
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -59,9 +68,11 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Optional, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import anyio
 import httpx
@@ -79,6 +90,13 @@ TIMEOUT = float(os.environ.get("BLENDER_TIMEOUT", "30"))
 READ_ONLY = os.environ.get("BLENDER_MCP_READONLY", "").lower() in ("1", "true", "yes", "on")
 SAFE_MODE = os.environ.get("BLENDER_MCP_SAFE_MODE", "").lower() in ("1", "true", "yes", "on")
 POLYPIZZA_API_KEY = os.environ.get("POLYPIZZA_API_KEY", "")
+SKETCHFAB_API_KEY = os.environ.get("SKETCHFAB_API_KEY", "")
+HYPER3D_API_KEY = os.environ.get("HYPER3D_API_KEY", "")
+HYPER3D_PLATFORM = os.environ.get("HYPER3D_PLATFORM", "hyper3d").strip().lower()  # hyper3d | fal
+HUNYUAN3D_SECRET_ID = os.environ.get("HUNYUAN3D_SECRET_ID", "")
+HUNYUAN3D_SECRET_KEY = os.environ.get("HUNYUAN3D_SECRET_KEY", "")
+HUNYUAN3D_API_URL = os.environ.get("HUNYUAN3D_API_URL", "")
+HUNYUAN3D_MODE = os.environ.get("HUNYUAN3D_MODE", "").strip().lower()  # official | local | (auto)
 
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT_CHARS = 20_000
@@ -206,33 +224,19 @@ class BlenderConnection:
 _conn = BlenderConnection(HOST, PORT, TOKEN, TIMEOUT)
 
 
-def _unwrap(resp: dict, integration: Optional[str] = None) -> Any:
-    """Turn an add-on reply into a result, or raise ToolError.
-
-    The add-on reports failures in two ways: {"status": "error", "message": ...} and, for most
-    integration handlers, {"status": "success", "result": {"error": ...}}. Both are errors here.
-    """
+def _unwrap(resp: dict) -> Any:
+    """Turn an add-on reply into a result, or raise ToolError."""
     if resp.get("status") == "error":
-        message = str(resp.get("message", "Unknown error"))
-        if integration and message.startswith("Unknown command type"):
-            message = (
-                f"The {integration} integration is disabled in Blender. Tick it in the BlenderMCP panel "
-                "(N sidebar > BlenderMCP) and try again."
-            )
-        raise ToolError(message)
-    result = resp.get("result")
-    if isinstance(result, dict) and result.get("error"):
-        raise ToolError(str(result["error"]))
-    return result
+        raise ToolError(str(resp.get("message", "Unknown error")))
+    return resp.get("result")
 
 
-async def call(command: str, params: Optional[dict] = None, *, timeout: Optional[float] = None,
-               integration: Optional[str] = None) -> Any:
+async def call(command: str, params: Optional[dict] = None, *, timeout: Optional[float] = None) -> Any:
     try:
         resp = await anyio.to_thread.run_sync(lambda: _conn.send(command, params, timeout))
     except BlenderError as e:
         raise ToolError(str(e)) from None
-    return _unwrap(resp, integration)
+    return _unwrap(resp)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -281,14 +285,155 @@ async def _query(body: str, params: Optional[dict] = None, timeout: Optional[flo
     return data
 
 
-def _is_code_disabled(e: ToolError) -> bool:
-    return "disabled" in str(e).lower() and "code" in str(e).lower()
-
-
 def _path(p: str) -> Path:
     """Resolve a path. Relative paths resolve against this server's working directory
     (Claude Code starts MCP servers in the project directory)."""
     return Path(p).expanduser().resolve()
+
+
+# --------------------------------------------------------------------------- network
+#
+# Everything this server sends over the internet goes through the helpers below, so it can be reviewed in one
+# place and swapped for a mock transport in the tests. The add-on in Blender does no networking at all.
+
+_client_factory = None  # the tests replace this with a factory that builds clients on an httpx.MockTransport
+
+USER_AGENT = "blender-mcp-claude-code"
+_MAX_DOWNLOAD_BYTES = 600 * 1024 * 1024
+_MAX_EXTRACT_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_EXTRACT_FILES = 5000
+
+
+def _new_client(timeout: float = 30, redirects: bool = True, headers: Optional[dict] = None) -> httpx.AsyncClient:
+    kwargs = dict(headers={"User-Agent": USER_AGENT, **(headers or {})}, timeout=timeout, follow_redirects=redirects)
+    return (_client_factory or httpx.AsyncClient)(**kwargs)
+
+
+def _check_url(url: Any, *, allow_http: bool = False, allow_local: bool = False) -> httpx.URL:
+    """Refuse URLs that would make this server talk to the user's own machine or network (the data in these
+    URLs comes from third-party APIs). `allow_local` is for the one case where the user configured such a
+    server on purpose: a local Hunyuan3D."""
+    try:
+        parsed = httpx.URL(str(url))
+    except Exception:
+        raise ToolError(f"Invalid URL: {str(url)[:120]}") from None
+    if parsed.scheme not in (("https", "http") if allow_http else ("https",)):
+        raise ToolError(f"Refusing to use a non-HTTPS URL ({parsed.scheme}://{parsed.host})")
+    host = (parsed.host or "").lower()
+    if not host:
+        raise ToolError(f"Invalid URL: {str(url)[:120]}")
+    if not allow_local:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if host == "localhost" or host.endswith((".local", ".localhost", ".internal")) or (
+                ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                                    or ip.is_multicast or ip.is_unspecified)):
+            raise ToolError(f"Refusing to contact a local or private address ({host})")
+    return parsed
+
+
+async def _http_get(url: str, *, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: float = 30,
+                    redirects: bool = True, allow_http: bool = False, allow_local: bool = False) -> httpx.Response:
+    parsed = _check_url(url, allow_http=allow_http, allow_local=allow_local)
+    try:
+        async with _new_client(timeout, redirects, headers) as client:
+            return await client.get(url, params=params)
+    except httpx.HTTPError as e:
+        raise ToolError(f"Network error contacting {parsed.host}: {e}") from None
+
+
+async def _http_post(url: str, *, json_body: Any = None, content: Optional[bytes] = None, files: Optional[list] = None,
+                     headers: Optional[dict] = None, timeout: float = 60, allow_http: bool = False,
+                     allow_local: bool = False) -> httpx.Response:
+    parsed = _check_url(url, allow_http=allow_http, allow_local=allow_local)
+    try:
+        async with _new_client(timeout, True, headers) as client:
+            return await client.post(url, json=json_body, content=content, files=files)
+    except httpx.HTTPError as e:
+        raise ToolError(f"Network error contacting {parsed.host}: {e}") from None
+
+
+async def _download(url: str, dest: Path, *, headers: Optional[dict] = None, timeout: float = 300,
+                    max_bytes: int = _MAX_DOWNLOAD_BYTES) -> int:
+    """Stream a file to disk, refusing anything larger than max_bytes. Returns the size."""
+    parsed = _check_url(url)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    try:
+        async with _new_client(timeout, True, headers) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise ToolError(f"Download failed: HTTP {response.status_code} from {parsed.host}")
+                with dest.open("wb") as out:
+                    async for chunk in response.aiter_bytes(65536):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ToolError(f"A download from {parsed.host} is larger than {max_bytes // 2**20} MB; refusing it")
+                        out.write(chunk)
+    except httpx.HTTPError as e:
+        dest.unlink(missing_ok=True)
+        raise ToolError(f"Network error downloading from {parsed.host}: {e}") from None
+    except ToolError:
+        dest.unlink(missing_ok=True)
+        raise
+    return total
+
+
+async def _download_all(items: list[tuple[str, Path]], concurrency: int = 4) -> None:
+    """Download several files at once. Every download finishes (or fails) before this returns."""
+    gate = asyncio.Semaphore(concurrency)
+
+    async def one(url: str, dest: Path):
+        async with gate:
+            await _download(url, dest)
+
+    results = await asyncio.gather(*(one(u, d) for u, d in items), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
+def _safe_join(base: Path, relative: str) -> Path:
+    """base/relative, refusing anything that would land outside base (absolute paths, '..', drive letters)."""
+    rel = PurePosixPath(str(relative).replace("\\", "/"))
+    if rel.is_absolute() or not rel.parts or ".." in rel.parts or rel.parts[0].endswith(":"):
+        raise ToolError(f"Unsafe path in downloaded data: {str(relative)[:100]!r}")
+    root = base.resolve()
+    target = (root / Path(*rel.parts)).resolve()
+    if root not in target.parents:
+        raise ToolError(f"Unsafe path in downloaded data: {str(relative)[:100]!r}")
+    return target
+
+
+def _safe_extract(archive: Path, dest: Path) -> list[Path]:
+    """Unpack a zip into dest, writing only regular files strictly inside it, with limits on size and count."""
+    written: list[Path] = []
+    total = 0
+    try:
+        with zipfile.ZipFile(archive) as z:
+            infos = z.infolist()
+            if len(infos) > _MAX_EXTRACT_FILES:
+                raise ToolError(f"The archive has too many files ({len(infos)})")
+            for info in infos:
+                if info.is_dir():
+                    continue
+                total += info.file_size
+                if total > _MAX_EXTRACT_BYTES:
+                    raise ToolError("The archive is too large once unpacked; refusing it")
+                target = _safe_join(dest, info.filename)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+                written.append(target)
+    except zipfile.BadZipFile:
+        raise ToolError("The downloaded file is not a valid zip archive") from None
+    return written
+
+
+def _new_tempdir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="blender_mcp_dl_"))
 
 
 # --------------------------------------------------------------------------- server
@@ -625,18 +770,6 @@ def _guard_code(code: str) -> None:
 
 # --------------------------------------------------------------------------- inspection snippets
 
-SNIP_STATUS = """
-scene = bpy.context.scene
-print(json.dumps({
-    "blender_version": bpy.app.version_string,
-    "file": bpy.data.filepath or None,
-    "unsaved_changes": bpy.data.is_dirty,
-    "scene": scene.name,
-    "objects": len(scene.objects),
-    "render_engine": scene.render.engine,
-}))
-"""
-
 SNIP_DETAILS = """
 def r(v, n=4):
     return [round(float(x), n) for x in v]
@@ -873,19 +1006,26 @@ except Exception as _e:
 @_tool(read_only=True)
 async def blender_status() -> str:
     """Check the connection to Blender and report version, open file and scene. Call this first when
-    anything fails: it tells you whether Blender is reachable, whether the token is accepted, and
-    whether code execution is enabled."""
+    anything fails: it tells you whether Blender is reachable, whether the token is accepted, whether code
+    execution is enabled, and which asset libraries and AI generators this server has keys for."""
     try:
-        data = await _query(SNIP_STATUS)
-        data["code_execution"] = "enabled"
+        data = await call("ping")
     except ToolError as e:
-        if not _is_code_disabled(e):
-            raise
-        info = await call("get_scene_info")
-        data = {"scene": info.get("name"), "objects": info.get("object_count"), "code_execution": "disabled"}
+        if "Unknown command type" in str(e):
+            raise ToolError(
+                "The Blender add-on is too old for this server. Reinstall blender_mcp.py (version 2.x) from this "
+                "repository: Preferences > Add-ons, remove the old one, restart Blender, install the new file."
+            ) from None
+        raise
     data["endpoint"] = f"{HOST}:{PORT}"
     data["read_only_mode"] = READ_ONLY
     data["safe_mode"] = SAFE_MODE
+    data["libraries"] = {"polyhaven": "ready (no key needed)", "sketchfab": bool(SKETCHFAB_API_KEY),
+                         "polypizza": bool(POLYPIZZA_API_KEY)}
+    data["generators"] = {"hyper3d_rodin": (_rodin_platform() if HYPER3D_API_KEY else False),
+                          "hunyuan3d": (HUNYUAN3D_MODE if HUNYUAN3D_MODE in ("official", "local") else
+                                        "official" if (HUNYUAN3D_SECRET_ID and HUNYUAN3D_SECRET_KEY) else
+                                        "local" if HUNYUAN3D_API_URL else False)}
     return _compact(data)
 
 
@@ -1209,15 +1349,7 @@ async def get_scene_info(
       200k faces), weights (vertices no deform bone moves, deform bones with no vertex group)
     - extras: settings (engine, resolution, frames, camera, HDRI, units) and collections (hierarchy)
     Use get_object_details for one object's full state."""
-    params = _scene_params(query, root, fields, limit)
-    try:
-        return _format_scene(await _query(SNIP_SCENE, params))
-    except ToolError as e:
-        if not _is_code_disabled(e):
-            raise
-        info = await call("get_scene_info")
-        info["note"] = "Code execution is disabled in the add-on panel; showing the reduced built-in summary."
-        return _compact(info)
+    return _format_scene(await _query(SNIP_SCENE, _scene_params(query, root, fields, limit)))
 
 
 @mcp.resource("blender://scene")
@@ -1699,24 +1831,30 @@ async def export_scene(
 
 POLYHAVEN_API = "https://api.polyhaven.com"
 POLYPIZZA_API = "https://api.poly.pizza/v1.1"
-USER_AGENT = "blender-mcp-claude-code"
 ASSET_SOURCES = ("polyhaven", "sketchfab", "polypizza")
 POLYHAVEN_TYPES = {0: "hdris", 1: "textures", 2: "models"}
 POLYHAVEN_TTL = 600.0
 THUMBNAIL_HOSTS = ("polyhaven.com", "sketchfab.com", "poly.pizza")
 _polyhaven_cache: dict[str, tuple[float, dict]] = {}
 
-# Category ids are the Poly Pizza API's; the names and aliases follow the table published by mcp-for-blender
-# (MIT, (c) 2025 Siddharth Ahuja, see LICENSE-blender-mcp.txt).
+# Category ids and names are the Poly Pizza API's; the aliases are everyday words people use for them.
 POLYPIZZA_CATEGORIES = {
     "Food & Drink": 0, "Clutter": 1, "Weapons": 2, "Transport": 3, "Furniture & Decor": 4, "Objects": 5,
     "Nature": 6, "Animals": 7, "Buildings": 8, "People & Characters": 9, "Scenes & Levels": 10, "Other": 11,
 }
 POLYPIZZA_ALIASES = {
-    "food": 0, "drink": 0, "drinks": 0, "weapon": 2, "vehicle": 3, "vehicles": 3, "transportation": 3,
-    "furniture": 4, "decor": 4, "object": 5, "prop": 5, "props": 5, "plant": 6, "plants": 6, "animal": 7,
-    "building": 8, "architecture": 8, "person": 9, "character": 9, "characters": 9, "people": 9,
-    "scene": 10, "scenes": 10, "level": 10, "levels": 10,
+    "food": 0, "drink": 0, "drinks": 0, "meal": 0, "snack": 0,
+    "junk": 1, "mess": 1,
+    "weapon": 2, "gun": 2, "sword": 2,
+    "vehicle": 3, "vehicles": 3, "car": 3, "cars": 3, "transportation": 3,
+    "furniture": 4, "decor": 4, "decoration": 4, "interior": 4,
+    "object": 5, "prop": 5, "props": 5, "tool": 5,
+    "plant": 6, "plants": 6, "tree": 6, "trees": 6, "terrain": 6,
+    "animal": 7, "pet": 7,
+    "building": 8, "architecture": 8, "house": 8,
+    "person": 9, "character": 9, "characters": 9, "people": 9, "human": 9,
+    "scene": 10, "scenes": 10, "level": 10, "levels": 10, "environment": 10,
+    "misc": 11, "miscellaneous": 11,
 }
 _SYNONYMS = {
     "couch": ("sofa",), "sofa": ("couch",), "tv": ("television",), "television": ("tv",),
@@ -1793,16 +1931,138 @@ else:
     print(json.dumps({"material": mat.name, "assigned": done, "skipped": skipped, "kept_with_fake_user": bool(mat.use_fake_user)}))
 """
 
-SNIP_IMPORT_GLB = """
+SNIP_IMPORT_FILE = """
+import os
 before = set(bpy.data.objects.keys())
-bpy.ops.import_scene.gltf(filepath=_P["path"])
+path, kind = _P["path"], _P["kind"]
+if kind == "gltf":
+    bpy.ops.import_scene.gltf(filepath=path)
+elif kind == "fbx":
+    bpy.ops.import_scene.fbx(filepath=path)
+elif kind == "obj":
+    if hasattr(bpy.ops.wm, "obj_import"):
+        bpy.ops.wm.obj_import(filepath=path)
+    else:
+        bpy.ops.import_scene.obj(filepath=path)
+else:
+    raise Exception("Unknown file kind: " + kind)
 new = [o for o in bpy.data.objects if o.name not in before]
+# Images that still point into the download folder would break when it is deleted: embed them in the file
+root_dir = os.path.normcase(os.path.realpath(_P["pack_dir"]))
+for img in bpy.data.images:
+    try:
+        if img.packed_file is None and img.filepath:
+            if os.path.normcase(os.path.realpath(bpy.path.abspath(img.filepath))).startswith(root_dir):
+                img.pack()
+    except Exception:
+        pass
 names = [o.name for o in new]
 roots = [o for o in new if o.parent is None or o.parent.name not in names]
 for o in roots:
     for key, value in _P["props"].items():
         o[key] = value
-print(json.dumps({"names": names, "roots": [o.name for o in roots]}))
+if _P.get("name") and len(roots) == 1:
+    roots[0].name = _P["name"]
+print(json.dumps({"names": [o.name for o in new], "roots": [o.name for o in roots]}))
+"""
+
+SNIP_HDRI = """
+scene = bpy.context.scene
+img = bpy.data.images.load(_P["path"])
+img.name = _P["name"]
+try:
+    img.pack()
+except Exception:
+    pass
+world = scene.world
+if world is None:
+    world = bpy.data.worlds.new("World")
+    scene.world = world
+try:
+    world.use_nodes = True
+except Exception:
+    pass
+nt = world.node_tree
+for n in list(nt.nodes):
+    nt.nodes.remove(n)
+coord = nt.nodes.new("ShaderNodeTexCoord")
+mapping = nt.nodes.new("ShaderNodeMapping")
+env = nt.nodes.new("ShaderNodeTexEnvironment")
+bg = nt.nodes.new("ShaderNodeBackground")
+out = nt.nodes.new("ShaderNodeOutputWorld")
+env.image = img
+coord.location, mapping.location, env.location, bg.location, out.location = (-800, 0), (-600, 0), (-380, 0), (-120, 0), (120, 0)
+nt.links.new(coord.outputs["Generated"], mapping.inputs["Vector"])
+nt.links.new(mapping.outputs["Vector"], env.inputs["Vector"])
+nt.links.new(env.outputs["Color"], bg.inputs["Color"])
+nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+print(json.dumps({"world": world.name, "image": img.name, "size": list(img.size)}))
+"""
+
+SNIP_TEXTURE_MATERIAL = """
+mat = bpy.data.materials.new(_P["name"])
+try:
+    mat.use_nodes = True
+except Exception:
+    pass
+nt = mat.node_tree
+for n in list(nt.nodes):
+    nt.nodes.remove(n)
+out = nt.nodes.new("ShaderNodeOutputMaterial")
+out.location = (600, 0)
+bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+bsdf.location = (300, 0)
+nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+coord = nt.nodes.new("ShaderNodeTexCoord")
+coord.location = (-1000, 0)
+mapping = nt.nodes.new("ShaderNodeMapping")
+mapping.location = (-800, 0)
+nt.links.new(coord.outputs["UV"], mapping.inputs["Vector"])
+
+def tex(path, label, colorspace, y):
+    img = bpy.data.images.load(path)
+    img.colorspace_settings.name = colorspace
+    try:
+        img.pack()
+    except Exception:
+        pass
+    node = nt.nodes.new("ShaderNodeTexImage")
+    node.image = img
+    node.label = label
+    node.location = (-500, y)
+    nt.links.new(mapping.outputs["Vector"], node.inputs["Vector"])
+    return node
+
+maps, used = _P["maps"], []
+if "diff" in maps:
+    n = tex(maps["diff"], "Base Color", "sRGB", 300)
+    nt.links.new(n.outputs["Color"], bsdf.inputs["Base Color"])
+    used.append("diff")
+if "arm" in maps:
+    n = tex(maps["arm"], "ARM (occlusion / roughness / metallic)", "Non-Color", 0)
+    sep = nt.nodes.new("ShaderNodeSeparateColor")
+    sep.location = (-200, 0)
+    nt.links.new(n.outputs["Color"], sep.inputs["Color"])
+    nt.links.new(sep.outputs["Green"], bsdf.inputs["Roughness"])
+    nt.links.new(sep.outputs["Blue"], bsdf.inputs["Metallic"])
+    used.append("arm")
+else:
+    if "rough" in maps:
+        n = tex(maps["rough"], "Roughness", "Non-Color", 0)
+        nt.links.new(n.outputs["Color"], bsdf.inputs["Roughness"])
+        used.append("rough")
+    if "metal" in maps:
+        n = tex(maps["metal"], "Metallic", "Non-Color", -300)
+        nt.links.new(n.outputs["Color"], bsdf.inputs["Metallic"])
+        used.append("metal")
+if "nor_gl" in maps:
+    n = tex(maps["nor_gl"], "Normal (OpenGL)", "Non-Color", -600)
+    nm = nt.nodes.new("ShaderNodeNormalMap")
+    nm.location = (0, -600)
+    nt.links.new(n.outputs["Color"], nm.inputs["Color"])
+    nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+    used.append("nor_gl")
+print(json.dumps({"material": mat.name, "maps": used}))
 """
 
 
@@ -1853,14 +2113,7 @@ def _polypizza_id(table_value: Optional[str]) -> Optional[int]:
     raise ToolError(f"Unknown Poly Pizza category '{table_value}'. Valid categories: {', '.join(POLYPIZZA_CATEGORIES)}")
 
 
-async def _http_get(url: str, *, params: Optional[dict] = None, headers: Optional[dict] = None,
-                    timeout: float = 30, redirects: bool = True) -> httpx.Response:
-    try:
-        async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT, **(headers or {})}, timeout=timeout,
-                                     follow_redirects=redirects) as client:
-            return await client.get(url, params=params)
-    except httpx.HTTPError as e:
-        raise ToolError(f"Network error contacting {httpx.URL(url).host}: {e}") from None
+
 
 
 def _thumbnail_allowed(url: Any) -> bool:
@@ -1937,20 +2190,46 @@ async def _search_polyhaven(query: str, asset_type: str, category: Optional[str]
     return "\n".join([head, *lines, tail]) if lines else head + ". Try other words or a broader category.", thumbs
 
 
+SKETCHFAB_API = "https://api.sketchfab.com/v3"
+
+
+def _sketchfab_headers() -> dict:
+    key = _need(SKETCHFAB_API_KEY, "Sketchfab", "SKETCHFAB_API_KEY",
+                "Create an API token in your Sketchfab account settings (Password & API).")
+    return {"Authorization": f"Token {key}"}
+
+
+def _sketchfab_check(r: httpx.Response, what: str) -> None:
+    if r.status_code == 401:
+        raise ToolError(f"Sketchfab authentication failed for {what}. Check SKETCHFAB_API_KEY.")
+    if r.status_code == 403:
+        raise ToolError(f"Sketchfab refused {what}: the model is probably not downloadable with your account")
+    if r.status_code == 404:
+        raise ToolError(f"Sketchfab: {what} not found")
+    if r.status_code == 429:
+        raise ToolError("Sketchfab rate limit reached; try again in a moment")
+    if r.status_code != 200:
+        raise ToolError(f"Sketchfab returned HTTP {r.status_code} for {what}")
+
+
 async def _search_sketchfab(query: str, category: Optional[str], limit: int) -> tuple[str, list[str]]:
-    data = await call("search_sketchfab_models",
-                      {"query": query, "categories": category, "count": min(limit, 24), "downloadable": True},
-                      integration="Sketchfab")
+    headers = _sketchfab_headers()
+    params = {"type": "models", "q": query, "count": max(1, min(limit, 24)), "downloadable": "true",
+              "archives_flavours": "false"}
+    if category:
+        params["categories"] = category
+    r = await _http_get(f"{SKETCHFAB_API}/search", params=params, headers=headers)
+    _sketchfab_check(r, "search")
     lines, thumbs = [], []
-    for r in (data or {}).get("results", []):
-        lic = r.get("license")
-        images = (r.get("thumbnails") or {}).get("images") or []
+    for m in (r.json() or {}).get("results", []):
+        lic = m.get("license")
+        images = (m.get("thumbnails") or {}).get("images") or []
         pick = next((i for i in sorted(images, key=lambda i: i.get("width", 0)) if i.get("width", 0) >= 200),
                     images[0] if images else None)
         thumbs.append((pick or {}).get("url", ""))
         lines.append(" | ".join([
-            str(r.get("uid")), str(r.get("name")), "by " + str((r.get("user") or {}).get("username")),
-            f"{r.get('faceCount')} faces", "licence: " + str(lic.get("label") if isinstance(lic, dict) else lic)]))
+            str(m.get("uid")), str(m.get("name")), "by " + str((m.get("user") or {}).get("username")),
+            f"{m.get('faceCount')} faces", "licence: " + str(lic.get("label") if isinstance(lic, dict) else lic)]))
     if not lines:
         return "Sketchfab: no downloadable results. Try other words.", []
     return "\n".join([f"Sketchfab: {len(lines)} result(s). Check each licence before using a model.", *lines,
@@ -2029,9 +2308,9 @@ async def search_assets(
     import_asset needs).
     - polyhaven: HDRIs, PBR textures and realistic models, all CC0 (free, no key). Matches words against
       names, tags, categories and descriptions, understands simple synonyms (couch finds sofas), and
-      knows real-world sizes. Needs 'Use assets from Poly Haven' enabled in the Blender panel to import.
+      knows real-world sizes.
     - sketchfab: a large catalogue of user-made models, including very specific ones; licences and face
-      counts vary per model. Needs the Sketchfab API key set in the Blender panel.
+      counts vary per model. Needs SKETCHFAB_API_KEY in this server's environment.
     - polypizza: stylised low-poly models, CC0 or CC-BY (credit the creator). Needs POLYPIZZA_API_KEY in
       this server's environment (free key at poly.pizza/settings/api).
     Ask for previews=3 when you need to judge how something looks before importing."""
@@ -2049,29 +2328,102 @@ async def _fit(names: list[str], target_size: Optional[float]) -> dict:
     return await _query(SNIP_FIT, {"names": names, "target_size": target_size})
 
 
+def _res_key(resolution: Any) -> int:
+    try:
+        return int(str(resolution).lower().rstrip("k"))
+    except ValueError:
+        return 0
+
+
+def _available(by_res: dict) -> str:
+    return ", ".join(sorted(by_res, key=_res_key)) or "none"
+
+
 async def _import_polyhaven(id: str, asset_type: Optional[str], target_size: Optional[float],
                             apply_to: Optional[list[str]], resolution: str, file_format: Optional[str],
                             timeout: float) -> dict:
+    quoted = quote(id, safe="")
     if not asset_type:
-        r = await _http_get(f"{POLYHAVEN_API}/info/{quote(id, safe='')}")
+        r = await _http_get(f"{POLYHAVEN_API}/info/{quoted}")
         if r.status_code != 200:
             raise ToolError(f"Poly Haven has no asset '{id}' (HTTP {r.status_code}); search again for a valid id")
         asset_type = POLYHAVEN_TYPES.get(r.json().get("type"))
         if not asset_type:
             raise ToolError(f"Could not tell the type of Poly Haven asset '{id}'; pass asset_type")
-    result = await call("download_polyhaven_asset",
-                        {"asset_id": id, "asset_type": asset_type, "resolution": resolution, "file_format": file_format},
-                        timeout=timeout, integration="Poly Haven")
-    out: dict[str, Any] = {"source": "polyhaven", "asset_type": asset_type, "licence": "CC0 (no credit required)",
-                           "message": (result or {}).get("message")}
-    if asset_type == "textures" and (result or {}).get("material"):
-        out["material"] = await _query(SNIP_MATERIAL, {"material": result["material"], "apply_to": apply_to or []})
-        if not apply_to:
-            out["note"] = "Material created but not assigned to anything; pass apply_to=[object names] to use it."
-    elif asset_type == "models":
-        out["placed"] = await _fit((result or {}).get("imported_objects", []), target_size)
-    elif asset_type == "hdris":
-        out["note"] = "The HDRI is now the world lighting."
+    r = await _http_get(f"{POLYHAVEN_API}/files/{quoted}")
+    if r.status_code == 404:
+        raise ToolError(f"Poly Haven has no asset '{id}'; search again for a valid id")
+    if r.status_code != 200:
+        raise ToolError(f"Poly Haven API returned HTTP {r.status_code}")
+    files = r.json()
+    resolution = resolution.lower()
+    out: dict[str, Any] = {"source": "polyhaven", "asset_type": asset_type, "licence": "CC0 (no credit required)"}
+    workdir = _new_tempdir()
+    try:
+        if asset_type == "hdris":
+            by_res = files.get("hdri") or {}
+            if resolution not in by_res:
+                raise ToolError(f"Resolution {resolution} is not available for this HDRI. Available: {_available(by_res)}")
+            fmt = (file_format or "hdr").lower()
+            entry = by_res[resolution].get(fmt)
+            if not entry:
+                raise ToolError(f"Format '{fmt}' is not available for this HDRI at {resolution}: {', '.join(by_res[resolution])}")
+            dest = workdir / f"{id}_{resolution}.{fmt}"
+            await _download(entry["url"], dest)
+            out["world"] = await _query(SNIP_HDRI, {"path": str(dest), "name": id}, timeout=timeout)
+            out["note"] = "The HDRI is now the world lighting."
+        elif asset_type == "textures":
+            wanted = [("diff", "Diffuse")] + ([("arm", "arm")] if files.get("arm") else [("rough", "Rough"), ("metal", "Metal")]) \
+                + [("nor_gl", "nor_gl")]
+            maps: dict[str, str] = {}
+            items: list[tuple[str, Path]] = []
+            for key, api_key in wanted:
+                by_res = files.get(api_key)
+                if not by_res:
+                    if key == "diff":
+                        raise ToolError("This texture has no colour (Diffuse) map")
+                    continue
+                if resolution not in by_res:
+                    if key == "diff":
+                        raise ToolError(f"Resolution {resolution} is not available for this texture. Available: {_available(by_res)}")
+                    continue
+                formats = ([file_format.lower()] if file_format else []) + ["jpg", "png"]
+                fmt = next((f for f in formats if f in by_res[resolution]), None)
+                if fmt is None:
+                    if key == "diff":
+                        raise ToolError(f"Format not available for this texture at {resolution}: {', '.join(by_res[resolution])}")
+                    continue
+                dest = workdir / f"{key}_{resolution}.{fmt}"
+                items.append((by_res[resolution][fmt]["url"], dest))
+                maps[key] = str(dest)
+            await _download_all(items)
+            created = await _query(SNIP_TEXTURE_MATERIAL, {"name": id, "maps": maps}, timeout=timeout)
+            assigned = await _query(SNIP_MATERIAL, {"material": created["material"], "apply_to": apply_to or []})
+            out["material"] = {**assigned, "maps": created["maps"]}
+            if not apply_to:
+                out["note"] = "Material created but not assigned to anything; pass apply_to=[object names] to use it."
+        elif asset_type == "models":
+            fmt = (file_format or "gltf").lower()
+            if fmt not in ("gltf", "fbx"):
+                raise ToolError("Poly Haven models: file_format must be 'gltf' (default) or 'fbx'")
+            by_res = files.get(fmt) or {}
+            entry = (by_res.get(resolution) or {}).get(fmt)
+            if not entry:
+                raise ToolError(f"No {fmt} version of this model at {resolution}. Available resolutions: {_available(by_res)}")
+            main = _safe_join(workdir, PurePosixPath(urlparse(entry["url"]).path).name)
+            items = [(entry["url"], main)]
+            for relative, extra in (entry.get("include") or {}).items():
+                items.append((extra["url"], _safe_join(workdir, relative)))
+            await _download_all(items)
+            imported = await _query(SNIP_IMPORT_FILE, {"path": str(main), "kind": fmt, "pack_dir": str(workdir),
+                                                       "props": {"polyhaven_id": id, "licence": "CC0"}, "name": None},
+                                    timeout=timeout)
+            out["placed"] = await _fit(imported["names"], target_size)
+            out["roots"] = imported["roots"]
+        else:
+            raise ToolError(f"Unknown Poly Haven asset type '{asset_type}'")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
     return out
 
 
@@ -2079,9 +2431,39 @@ async def _import_sketchfab(id: str, target_size: Optional[float], timeout: floa
     if not target_size:
         raise ToolError("target_size (metres, largest dimension) is required for sketchfab: library models come "
                         "at arbitrary scale. Examples: chair 1.0, car 4.5, cup 0.12")
-    result = await call("download_sketchfab_model", {"uid": id, "normalize_size": True, "target_size": target_size},
-                        timeout=timeout, integration="Sketchfab")
-    return {"source": "sketchfab", "licence": "see the model's licence from search_assets", **(result or {})}
+    headers = _sketchfab_headers()
+    quoted = quote(id, safe="")
+    r = await _http_get(f"{SKETCHFAB_API}/models/{quoted}/download", headers=headers)
+    _sketchfab_check(r, f"download of model '{id}'")
+    url = ((r.json() or {}).get("gltf") or {}).get("url")
+    if not url:
+        raise ToolError("Sketchfab offers no glTF download for this model (it may not be downloadable with your account)")
+    meta: dict = {}
+    try:  # best effort: name, author and licence, kept on the object because most models need credit
+        info = await _http_get(f"{SKETCHFAB_API}/models/{quoted}", headers=headers)
+        if info.status_code == 200:
+            meta = info.json() or {}
+    except ToolError:
+        pass
+    workdir = _new_tempdir()
+    try:
+        archive = workdir / "model.zip"
+        await _download(url, archive, timeout=max(timeout, 120))  # a signed URL: it takes no API token
+        unpacked = _safe_extract(archive, workdir / "model")
+        model = _first_with_suffix(unpacked, ".gltf", ".glb")
+        licence = (meta.get("license") or {}).get("label") if isinstance(meta.get("license"), dict) else meta.get("license")
+        author = (meta.get("user") or {}).get("username")
+        props = {"sketchfab_uid": id, "sketchfab_name": str(meta.get("name") or ""), "sketchfab_author": str(author or ""),
+                 "sketchfab_licence": str(licence or ""), "sketchfab_url": str(meta.get("viewerUrl") or "")}
+        imported = await _query(SNIP_IMPORT_FILE, {"path": str(model), "kind": "gltf", "pack_dir": str(workdir),
+                                                   "props": props, "name": None}, timeout=timeout)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    out = {"source": "sketchfab", "name": meta.get("name"), "author": author, "licence": licence,
+           "placed": await _fit(imported["names"], target_size), "roots": imported["roots"]}
+    if licence and "attribution" in str(licence).lower():
+        out["credit_required"] = f"{meta.get('name')} by {author} ({meta.get('viewerUrl')}) - {licence}"
+    return out
 
 
 async def _import_polypizza(id: str, target_size: Optional[float], timeout: float) -> dict:
@@ -2099,15 +2481,16 @@ async def _import_polypizza(id: str, target_size: Optional[float], timeout: floa
                             "datacenter/VPN IPs: retry from a normal connection, or download the .glb by hand from "
                             "https://poly.pizza and import it with File > Import > glTF 2.0.")
         raise ToolError(f"Poly Pizza returned something that is not a GLB file (HTTP {f.status_code})")
-    tmpdir = Path(tempfile.mkdtemp(prefix="blender_mcp_pp_"))
+    workdir = _new_tempdir()
     try:
-        glb = tmpdir / ((re.sub(r"[^A-Za-z0-9_-]", "_", id) or "model") + ".glb")
+        glb = workdir / ((re.sub(r"[^A-Za-z0-9_-]", "_", id) or "model") + ".glb")
         glb.write_bytes(f.content)
         props = {"polypizza_id": str(model.get("ID") or id), "polypizza_licence": str(model.get("Licence") or ""),
                  "polypizza_attribution": str(model.get("Attribution") or "")}
-        imported = await _query(SNIP_IMPORT_GLB, {"path": str(glb), "props": props}, timeout=timeout)
+        imported = await _query(SNIP_IMPORT_FILE, {"path": str(glb), "kind": "gltf", "pack_dir": str(workdir),
+                                                   "props": props, "name": None}, timeout=timeout)
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(workdir, ignore_errors=True)
     out = {"source": "polypizza", "licence": model.get("Licence"), "creator": (model.get("Creator") or {}).get("Username"),
            "placed": await _fit(imported["names"], target_size), "roots": imported["roots"]}
     if model.get("Attribution"):
@@ -2143,73 +2526,110 @@ async def import_asset(
 # --------------------------------------------------------------------------- tools: AI 3D generation
 #
 # Generation is asynchronous on the provider side. The tools hide the differences between Hyper3D Rodin
-# (hyper3d.ai / fal.ai) and Hunyuan3D (Tencent cloud / local server) behind an opaque job handle:
+# (hyper3d.ai / fal.ai) and Hunyuan3D (Tencent cloud / your own server) behind an opaque job handle:
 #   rodin|main|<subscription_key>|<uuid>     rodin|fal|<request_id>     hunyuan|<job_id>
+# The server talks to the providers itself (keys come from environment variables) and only the finished
+# model is imported into Blender, so Blender is never frozen while waiting for a provider.
 
 RODIN_POLL_SECONDS = 8
 HUNYUAN_POLL_SECONDS = 10
-
-SNIP_OBJECT_NAMES = """
-print(json.dumps(list(bpy.data.objects.keys())))
-"""
-
-SNIP_RENAME_ROOT = """
-names = _P["names"]
-objs = [bpy.data.objects[n] for n in names if n in bpy.data.objects]
-roots = [o for o in objs if o.parent is None or o.parent.name not in names]
-root = None
-if len(roots) == 1:
-    roots[0].name = _P["name"]
-    root = roots[0].name
-print(json.dumps({"root": root, "new_objects": [o.name for o in objs]}))
-"""
+HYPER3D_API = "https://hyperhuman.deemos.com/api/v2"
+FAL_RODIN_API = "https://queue.fal.run/fal-ai/hyper3d"
+RODIN_TIER = "Sketch"
+RODIN_MESH_MODE = "Raw"
+TENCENT_SERVICE, TENCENT_VERSION, TENCENT_REGION = "hunyuan", "2023-09-01", "ap-guangzhou"
+MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
 
 
-def _msg(text: Any) -> str:
-    return " ".join(str(text).split())
+def _tc3_headers(secret_id: str, secret_key: str, action: str, payload: dict, *, timestamp: Optional[int] = None,
+                 service: str = TENCENT_SERVICE, version: str = TENCENT_VERSION,
+                 region: str = TENCENT_REGION) -> tuple[dict, str, str]:
+    """Sign a Tencent Cloud API call (TC3-HMAC-SHA256, https://cloud.tencent.com/document/api/213/30654).
+    Returns (headers, body, endpoint); `body` is exactly the text that was signed and must be sent as is."""
+    ts = int(time.time() if timestamp is None else timestamp)
+    date = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+    host = f"{service}.tencentcloudapi.com"
+    body = json.dumps(payload)
+    content_type = "application/json; charset=utf-8"
+    signed_headers = "content-type;host;x-tc-action"
+    canonical_request = "\n".join([
+        "POST", "/", "",
+        f"content-type:{content_type}\nhost:{host}\nx-tc-action:{action.lower()}\n",
+        signed_headers,
+        hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    ])
+    scope = f"{date}/{service}/tc3_request"
+    string_to_sign = "\n".join(["TC3-HMAC-SHA256", str(ts), scope, hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
+
+    def hmac_sha256(key: bytes, message: str) -> bytes:
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+    signing_key = hmac_sha256(hmac_sha256(hmac_sha256(("TC3" + secret_key).encode("utf-8"), date), service), "tc3_request")
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "Authorization": f"TC3-HMAC-SHA256 Credential={secret_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        "Content-Type": content_type,
+        "Host": host,
+        "X-TC-Action": action,
+        "X-TC-Timestamp": str(ts),
+        "X-TC-Version": version,
+        "X-TC-Region": region,
+    }
+    return headers, body, f"https://{host}"
 
 
-async def _require_ready(status_command: str, label: str) -> dict:
-    """The add-on reports whether an integration is enabled and configured (API key, URL...)."""
-    status = await call(status_command)
-    if not isinstance(status, dict) or not status.get("enabled"):
-        detail = _msg(status.get("message", "")) if isinstance(status, dict) else ""
-        raise ToolError(f"{label} is not ready: {detail}")
-    return status
+def _need(value: str, provider: str, variable: str, how: str) -> str:
+    if not value:
+        raise ToolError(f"{provider} is not configured: {how} Give it to this server as {variable} "
+                        f"(for example: claude mcp add blender -e {variable}=... -- uv run ...).")
+    return value
 
 
-def _is_url(text: str) -> bool:
-    return re.match(r"^https?://", text, re.IGNORECASE) is not None
+def _json_or_error(r: httpx.Response, what: str) -> Any:
+    if r.status_code in (401, 403):
+        raise ToolError(f"{what}: the API key or credentials were rejected (HTTP {r.status_code})")
+    if r.status_code == 429:
+        raise ToolError(f"{what}: rate limit reached or out of credits (HTTP 429)")
+    try:
+        data = r.json()
+    except ValueError:
+        raise ToolError(f"{what}: unexpected non-JSON reply (HTTP {r.status_code})") from None
+    if r.status_code >= 400:
+        raise ToolError(f"{what}: HTTP {r.status_code}: {_compact(data)[:300]}")
+    return data
 
 
-def _encode_images(paths: Optional[list[str]], urls: Optional[list[str]]) -> list:
-    """Local files become [suffix, base64]; URLs stay strings. The add-on adapts them to each platform."""
-    items: list = []
+def _read_local_images(paths: Optional[list[str]]) -> list[tuple[str, bytes]]:
+    out = []
     for p in paths or []:
         f = _path(p)
         try:
             data = f.read_bytes()
         except OSError as e:
             raise ToolError(f"Cannot read image {f}: {e}") from None
-        if len(data) > 10 * 1024 * 1024:
+        if len(data) > MAX_REFERENCE_IMAGE_BYTES:
             raise ToolError(f"Image {f.name} is larger than 10 MB; downscale it first")
-        items.append([f.suffix.lower() or ".png", base64.b64encode(data).decode("ascii")])
-    for u in urls or []:
-        if not _is_url(u):
-            raise ToolError(f"Not an http(s) URL: {u}")
-        items.append(u)
-    return items
+        out.append((f.suffix.lower() or ".png", data))
+    return out
 
 
-def _rodin_job(created: Any) -> str:
-    if isinstance(created, dict):
-        if created.get("request_id"):
-            return f"rodin|fal|{created['request_id']}"
-        jobs = created.get("jobs") or {}
-        if created.get("uuid") and isinstance(jobs, dict) and jobs.get("subscription_key"):
-            return f"rodin|main|{jobs['subscription_key']}|{created['uuid']}"
-    raise ToolError("Unexpected response from Rodin when creating the job (check the API key and credits): "
-                    + _compact(created)[:500])
+async def _fetch_image(url: str) -> tuple[str, bytes]:
+    r = await _http_get(url, timeout=60)
+    if r.status_code != 200 or not r.content:
+        raise ToolError(f"Could not download the reference image (HTTP {r.status_code}): {url[:100]}")
+    if len(r.content) > MAX_REFERENCE_IMAGE_BYTES:
+        raise ToolError("A reference image is larger than 10 MB; downscale it first")
+    suffix = Path(httpx.URL(url).path).suffix.lower()
+    return (suffix if suffix in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"), r.content
+
+
+def _data_uri(suffix: str, data: bytes) -> str:
+    mime = suffix.lstrip(".").lower().replace("jpg", "jpeg") or "png"
+    return f"data:image/{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _is_url(text: str) -> bool:
+    return re.match(r"^https?://", text, re.IGNORECASE) is not None
 
 
 def _tencent_error(resp: dict) -> Optional[ToolError]:
@@ -2228,6 +2648,99 @@ async def _progress(ctx: Optional[Context], elapsed: float, total: float) -> Non
         pass
 
 
+def _rodin_platform() -> str:
+    return "fal" if HYPER3D_PLATFORM == "fal" else "hyper3d"
+
+
+def _rodin_headers(platform: str) -> dict:
+    key = _need(HYPER3D_API_KEY, "Hyper3D Rodin", "HYPER3D_API_KEY",
+                "Get an API key at hyper3d.ai (or fal.ai, and set HYPER3D_PLATFORM=fal).")
+    return {"Authorization": f"Key {key}" if platform == "fal" else f"Bearer {key}"}
+
+
+async def _rodin_create(prompt: Optional[str], image_paths: Optional[list[str]], image_urls: Optional[list[str]],
+                        bbox_condition: Optional[list[float]]) -> str:
+    platform = _rodin_platform()
+    headers = _rodin_headers(platform)
+    local = _read_local_images(image_paths)
+    urls = list(image_urls or [])
+    for u in urls:
+        if not _is_url(u):
+            raise ToolError(f"Not an http(s) URL: {u}")
+    if platform == "fal":
+        body: dict[str, Any] = {"tier": RODIN_TIER}
+        images = [_data_uri(s, d) for s, d in local] + urls
+        if images:
+            body["input_image_urls"] = images
+        if prompt:
+            body["prompt"] = prompt
+        if bbox_condition:
+            body["bbox_condition"] = bbox_condition
+        data = _json_or_error(await _http_post(f"{FAL_RODIN_API}/rodin", json_body=body, headers=headers, timeout=120),
+                              "Rodin (fal.ai)")
+        if not (isinstance(data, dict) and data.get("request_id")):
+            raise ToolError("Unexpected response from Rodin when creating the job: " + _compact(data)[:500])
+        return f"rodin|fal|{data['request_id']}"
+    pictures = local + [await _fetch_image(u) for u in urls]
+    files: list = [("images", (f"{i:04d}{suffix}", content)) for i, (suffix, content) in enumerate(pictures)]
+    files += [("tier", (None, RODIN_TIER)), ("mesh_mode", (None, RODIN_MESH_MODE))]
+    if prompt:
+        files.append(("prompt", (None, prompt)))
+    if bbox_condition:
+        files.append(("bbox_condition", (None, json.dumps(bbox_condition))))
+    data = _json_or_error(await _http_post(f"{HYPER3D_API}/rodin", files=files, headers=headers, timeout=120),
+                          "Rodin (hyper3d.ai)")
+    key = ((data or {}).get("jobs") or {}).get("subscription_key") if isinstance(data, dict) else None
+    if not (isinstance(data, dict) and data.get("uuid") and key):
+        raise ToolError("Unexpected response from Rodin when creating the job (check the API key and credits): "
+                        + _compact(data)[:500])
+    return f"rodin|main|{key}|{data['uuid']}"
+
+
+async def _rodin_glb_url(parts: list[str]) -> str:
+    if parts[0] == "main":
+        data = _json_or_error(await _http_post(f"{HYPER3D_API}/download", json_body={"task_uuid": parts[2]},
+                                               headers=_rodin_headers("hyper3d")), "Rodin download")
+        for item in (data or {}).get("list", []):
+            if str(item.get("name", "")).lower().endswith(".glb") and item.get("url"):
+                return item["url"]
+        raise ToolError("Rodin finished but offered no .glb file: " + _compact(data)[:300])
+    data = _json_or_error(await _http_get(f"{FAL_RODIN_API}/requests/{quote(parts[1], safe='')}",
+                                          headers=_rodin_headers("fal")), "Rodin (fal.ai) result")
+    url = ((data or {}).get("model_mesh") or {}).get("url")
+    if not url:
+        raise ToolError("Rodin finished but returned no model: " + _compact(data)[:300])
+    return url
+
+
+def _hunyuan_mode() -> str:
+    choice = HUNYUAN3D_MODE
+    if choice in ("official", "local"):
+        return choice
+    if HUNYUAN3D_SECRET_ID and HUNYUAN3D_SECRET_KEY:
+        return "official"
+    if HUNYUAN3D_API_URL:
+        return "local"
+    raise ToolError(
+        "Hunyuan3D is not configured. Give this server either HUNYUAN3D_SECRET_ID and HUNYUAN3D_SECRET_KEY "
+        "(Tencent Cloud) or HUNYUAN3D_API_URL (your own Hunyuan3D server, e.g. http://localhost:8081), for example: "
+        "claude mcp add blender -e HUNYUAN3D_API_URL=http://localhost:8081 -- uv run ...")
+
+
+async def _hunyuan_api(action: str, payload: dict) -> dict:
+    sid = _need(HUNYUAN3D_SECRET_ID, "Hunyuan3D (Tencent Cloud)", "HUNYUAN3D_SECRET_ID", "Create API credentials in the Tencent Cloud console.")
+    skey = _need(HUNYUAN3D_SECRET_KEY, "Hunyuan3D (Tencent Cloud)", "HUNYUAN3D_SECRET_KEY", "Create API credentials in the Tencent Cloud console.")
+    headers, body, endpoint = _tc3_headers(sid, skey, action, payload)
+    r = await _http_post(endpoint, content=body.encode("utf-8"), headers=headers, timeout=60)
+    data = _json_or_error(r, f"Hunyuan3D {action}")
+    resp = data.get("Response") if isinstance(data, dict) else None
+    if not isinstance(resp, dict):
+        raise ToolError(f"Hunyuan3D {action}: unexpected response: " + _compact(data)[:300])
+    if (err := _tencent_error(resp)) is not None:
+        raise err
+    return resp
+
+
 async def _poll_job(kind: str, parts: list[str]) -> tuple[str, Any]:
     """Returns (state, detail) with state in running / done / failed."""
     valid = ((kind == "rodin" and parts[:1] == ["main"] and len(parts) == 3)
@@ -2237,27 +2750,24 @@ async def _poll_job(kind: str, parts: list[str]) -> tuple[str, Any]:
         raise ToolError("Invalid job handle. Pass the 'job' value returned by rodin_generate / hunyuan3d_generate unchanged.")
     try:
         if kind == "rodin" and parts[0] == "main":
-            data = await call("poll_rodin_job_status", {"subscription_key": parts[1]}, integration="Hyper3D Rodin")
-            statuses = data.get("status_list") if isinstance(data, dict) else None
+            data = _json_or_error(await _http_post(f"{HYPER3D_API}/status", json_body={"subscription_key": parts[1]},
+                                                   headers=_rodin_headers("hyper3d")), "Rodin status")
+            statuses = [j.get("status") for j in (data or {}).get("jobs", []) if isinstance(j, dict)]
             if not statuses:
                 raise ToolError(f"unexpected status reply: {_compact(data)[:300]}")
             if any(st == "Failed" for st in statuses):
                 return "failed", statuses
             return ("done" if all(st == "Done" for st in statuses) else "running"), statuses
         if kind == "rodin":
-            data = await call("poll_rodin_job_status", {"request_id": parts[1]}, integration="Hyper3D Rodin")
+            data = _json_or_error(await _http_get(f"{FAL_RODIN_API}/requests/{quote(parts[1], safe='')}/status",
+                                                  headers=_rodin_headers("fal")), "Rodin (fal.ai) status")
             status = data.get("status") if isinstance(data, dict) else None
             if status == "COMPLETED":
                 return "done", data
             if status in ("IN_QUEUE", "IN_PROGRESS"):
                 return "running", {k: data[k] for k in ("status", "queue_position") if k in data}
             return "failed", data
-        data = await call("poll_hunyuan_job_status", {"job_id": parts[0]}, integration="Hunyuan3D")
-        resp = data.get("Response") if isinstance(data, dict) else None
-        if not isinstance(resp, dict):
-            raise ToolError(f"unexpected status reply: {_compact(data)[:300]}")
-        if (err := _tencent_error(resp)) is not None:
-            raise err
+        resp = await _hunyuan_api("QueryHunyuanTo3DJob", {"JobId": parts[0].removeprefix("job_")})
         status = resp.get("Status")
         if status == "DONE":
             return "done", resp
@@ -2268,17 +2778,43 @@ async def _poll_job(kind: str, parts: list[str]) -> tuple[str, Any]:
         raise ToolError(f"Status check failed: {e}. Check the job handle, API key and credits.") from None
 
 
+async def _import_generated(path: Path, kind: str, name: str, workdir: Path, props: dict) -> dict:
+    imported = await _query(SNIP_IMPORT_FILE, {"path": str(path), "kind": kind, "pack_dir": str(workdir),
+                                               "props": props, "name": name}, timeout=180)
+    placed = await _fit(imported["names"], None)
+    return {"succeed": True, "name": (imported["roots"] or [None])[0], "objects": imported["names"][:20],
+            "dimensions_m": placed.get("dimensions_m"), "bbox_min": placed.get("bbox_min"),
+            "bbox_max": placed.get("bbox_max")}
+
+
+def _first_with_suffix(files: list[Path], *suffixes: str) -> Path:
+    for suffix in suffixes:
+        matches = sorted((f for f in files if f.suffix.lower() == suffix), key=lambda f: len(f.parts))
+        if matches:
+            return matches[0]
+    raise ToolError(f"The downloaded archive has no {'/'.join(suffixes)} model file")
+
+
 async def _import_job(kind: str, parts: list[str], name: str, detail: Any) -> Any:
-    if kind == "rodin":
-        params = ({"task_uuid": parts[2], "name": name} if parts[0] == "main"
-                  else {"request_id": parts[1], "name": name})
-        return await call("import_generated_asset", params, timeout=180, integration="Hyper3D Rodin")
-    files = detail.get("ResultFile3Ds") or []
-    chosen = next((f for f in files if str(f.get("Type", "")).upper() == "OBJ"), files[0] if files else None)
-    if not chosen or not chosen.get("Url"):
-        raise ToolError("Hunyuan3D finished but returned no downloadable file: " + _compact(detail)[:400])
-    return await call("import_generated_asset_hunyuan", {"name": name, "zip_file_url": chosen["Url"]},
-                      timeout=240, integration="Hunyuan3D")
+    workdir = _new_tempdir()
+    try:
+        if kind == "rodin":
+            glb = workdir / "model.glb"
+            await _download(await _rodin_glb_url(parts), glb)
+            if glb.read_bytes()[:4] != b"glTF":
+                raise ToolError("Rodin returned a file that is not a GLB model")
+            return await _import_generated(glb, "gltf", name, workdir, {"generator": "hyper3d-rodin"})
+        files = (detail or {}).get("ResultFile3Ds") or []
+        chosen = next((f for f in files if str(f.get("Type", "")).upper() == "OBJ"), files[0] if files else None)
+        if not chosen or not chosen.get("Url"):
+            raise ToolError("Hunyuan3D finished but returned no downloadable file: " + _compact(detail)[:400])
+        archive = workdir / "model.zip"
+        await _download(chosen["Url"], archive)
+        unpacked = _safe_extract(archive, workdir / "model")
+        obj = _first_with_suffix(unpacked, ".obj")
+        return await _import_generated(obj, "obj", name, workdir, {"generator": "hunyuan3d"})
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 async def _collect(ctx: Optional[Context], job: str, name: str, wait: bool, timeout_s: float) -> str:
@@ -2313,18 +2849,39 @@ async def rodin_generate(
     timeout_s: Annotated[float, Field(ge=10, le=3600, description="Maximum time to wait for the generation")] = 600,
 ) -> str:
     """Generate a 3D model with Hyper3D Rodin from a text prompt and/or reference images and import it into
-    the scene. CONSUMES the user's Rodin credits (the shared free-trial key is heavily rate-limited), so
-    confirm before calling. Generation takes a few minutes; if the wait times out you get a job handle to
-    pass to collect_generated_model. Needs 'Use Hyper3D Rodin' enabled and a key in the BlenderMCP panel.
-    The mesh is raw: check its scale and orientation afterwards."""
+    the scene. CONSUMES the user's Rodin credits, so confirm before calling. Generation takes a few minutes;
+    if the wait times out you get a job handle to pass to collect_generated_model. Needs HYPER3D_API_KEY in
+    this server's environment (HYPER3D_PLATFORM=fal to use fal.ai instead of hyper3d.ai). Blender stays
+    responsive while waiting. The mesh is raw: check its scale and orientation afterwards."""
     if not prompt and not image_paths and not image_urls:
         raise ToolError("Provide a prompt and/or reference images")
-    await _require_ready("get_hyper3d_status", "Hyper3D Rodin")
-    images = _encode_images(image_paths, image_urls)
-    created = await call("create_rodin_job",
-                         {"text_prompt": prompt, "images": images or None, "bbox_condition": bbox_condition},
-                         timeout=120, integration="Hyper3D Rodin")
-    return await _collect(ctx, _rodin_job(created), name, wait, timeout_s)
+    job = await _rodin_create(prompt, image_paths, image_urls, bbox_condition)
+    return await _collect(ctx, job, name, wait, timeout_s)
+
+
+async def _hunyuan_local(prompt: Optional[str], image: Optional[str], name: str, timeout: float, texture: bool,
+                         octree_resolution: int, inference_steps: int, guidance_scale: float) -> str:
+    payload: dict[str, Any] = {"octree_resolution": octree_resolution, "num_inference_steps": inference_steps,
+                               "guidance_scale": guidance_scale, "texture": texture}
+    if prompt:
+        payload["text"] = prompt
+    if image:
+        suffix, data = await _fetch_image(image) if _is_url(image) else _read_local_images([image])[0]
+        payload["image"] = base64.b64encode(data).decode("ascii")
+    r = await _http_post(f"{HUNYUAN3D_API_URL.rstrip('/')}/generate", json_body=payload, timeout=timeout,
+                         allow_http=True, allow_local=True)
+    if r.status_code != 200:
+        raise ToolError(f"The local Hunyuan3D server failed (HTTP {r.status_code}): {r.text[:300]}")
+    if r.content[:4] != b"glTF":
+        raise ToolError("The local Hunyuan3D server did not return a GLB model")
+    workdir = _new_tempdir()
+    try:
+        glb = workdir / "model.glb"
+        glb.write_bytes(r.content)
+        return _compact({"state": "imported",
+                         "result": await _import_generated(glb, "gltf", name, workdir, {"generator": "hunyuan3d-local"})})
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @_tool(read_only=False, destructive=False, open_world=True)
@@ -2335,47 +2892,37 @@ async def hunyuan3d_generate(
     name: Annotated[str, Field(description="Name for the imported object")] = "hunyuan_model",
     wait: Annotated[bool, Field(description="Official API only: wait for the result and import it, or return a job handle")] = True,
     timeout_s: Annotated[float, Field(ge=10, le=7200, description="Maximum time to wait for the generation")] = 900,
+    texture: Annotated[bool, Field(description="Local server only: also generate a texture")] = False,
+    octree_resolution: Annotated[int, Field(ge=128, le=512, description="Local server only: shape resolution")] = 256,
+    inference_steps: Annotated[int, Field(ge=1, le=100, description="Local server only")] = 20,
+    guidance_scale: Annotated[float, Field(ge=1, le=20, description="Local server only")] = 5.5,
 ) -> str:
     """Generate a 3D model with Tencent Hunyuan3D from text or an image and import it into the scene.
-    Works with the mode chosen in the BlenderMCP panel. Official API: exactly one of prompt / image; it is
-    asynchronous and CONSUMES the user's Tencent credits, so confirm before calling. Local server: runs
-    synchronously and Blender is FROZEN until it finishes (can take minutes; shape and texture settings come
-    from the panel); the imported root object is renamed to 'name' when it can be identified."""
-    status = await _require_ready("get_hunyuan3d_status", "Hunyuan3D")
+    Official API (HUNYUAN3D_SECRET_ID + HUNYUAN3D_SECRET_KEY): exactly one of prompt / image; asynchronous and
+    CONSUMES the user's Tencent credits, so confirm before calling. Your own server (HUNYUAN3D_API_URL):
+    one long request (minutes, and the GPU of that machine is busy); the model options above apply. Blender
+    stays responsive in both cases; the imported root object is renamed to 'name'."""
     if not prompt and not image:
         raise ToolError("Provide a prompt or an image")
-    img = (image if _is_url(image) else str(_path(image))) if image else None
-
-    if status.get("mode") == "OFFICIAL_API":
-        if prompt and image:
-            raise ToolError("The official Hunyuan3D API accepts either a prompt or an image, not both")
-        if prompt and len(prompt) > 200:
-            raise ToolError("The official Hunyuan3D API limits prompts to 200 characters")
-        created = await call("create_hunyuan_job", {"text_prompt": prompt, "image": img},
-                             timeout=120, integration="Hunyuan3D")
-        resp = created.get("Response") if isinstance(created, dict) else None
-        if not isinstance(resp, dict):
-            raise ToolError("Unexpected response from Hunyuan3D when creating the job: " + _compact(created)[:500])
-        if (err := _tencent_error(resp)) is not None:
-            raise err
-        if not resp.get("JobId"):
-            raise ToolError("Hunyuan3D returned no JobId: " + _compact(resp)[:500])
-        return await _collect(ctx, f"hunyuan|{resp['JobId']}", name, wait, timeout_s)
-
-    # Local server: one blocking request; the add-on imports the GLB on Blender's next timer tick.
-    before = set(await _query(SNIP_OBJECT_NAMES))
-    await call("create_hunyuan_job", {"text_prompt": prompt, "image": img}, timeout=timeout_s, integration="Hunyuan3D")
-    new: list[str] = []
-    for _ in range(30):  # the import runs asynchronously; wait until the new objects stop appearing
-        await anyio.sleep(0.5)
-        names = [n for n in await _query(SNIP_OBJECT_NAMES) if n not in before]
-        if names and names == new:
-            break
-        new = names
-    if not new:
-        raise ToolError("Hunyuan3D reported success but no new objects appeared in the scene")
-    info = await _query(SNIP_RENAME_ROOT, {"names": new, "name": name})
-    return _compact({"state": "imported", "result": info})
+    mode = _hunyuan_mode()
+    if mode == "local":
+        _need(HUNYUAN3D_API_URL, "Hunyuan3D (local server)", "HUNYUAN3D_API_URL", "Point it at your server, e.g. http://localhost:8081.")
+        return await _hunyuan_local(prompt, image, name, timeout_s, texture, octree_resolution, inference_steps, guidance_scale)
+    if prompt and image:
+        raise ToolError("The official Hunyuan3D API accepts either a prompt or an image, not both")
+    if prompt and len(prompt) > 200:
+        raise ToolError("The official Hunyuan3D API limits prompts to 200 characters")
+    payload: dict[str, Any] = {"Num": 1}
+    if prompt:
+        payload["Prompt"] = prompt
+    elif _is_url(image):
+        payload["ImageUrl"] = image
+    else:
+        payload["ImageBase64"] = base64.b64encode(_read_local_images([image])[0][1]).decode("ascii")
+    resp = await _hunyuan_api("SubmitHunyuanTo3DJob", payload)
+    if not resp.get("JobId"):
+        raise ToolError("Hunyuan3D returned no JobId: " + _compact(resp)[:500])
+    return await _collect(ctx, f"hunyuan|{resp['JobId']}", name, wait, timeout_s)
 
 
 @_tool(read_only=False, destructive=False, open_world=True)
