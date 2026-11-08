@@ -47,6 +47,7 @@ variables when you register it, for example
 | `blender_status` | Diagnostics: connection, versions, open file, code switch, safe mode, which libraries/generators have keys |
 | `get_scene_info` | Compact text facts: counts, selection, per-object placement, contents and mesh/rig **health** |
 | `get_object_details` | Full state of one object: transform, modifiers, materials, mesh, camera, light |
+| `get_node_tree` | Read a shader, Geometry Nodes, world or compositor node tree: nodes, settings and links |
 | `look` | See the scene as images: live viewport, scene camera, auto-framed angles, animation frames |
 | `render_image` | Final-quality render to a file (scene render settings are restored afterwards) |
 | `execute_blender_code` | Short Python snippets inside Blender (creates a Ctrl+Z undo step first) |
@@ -69,6 +70,25 @@ One header line and one line per object, with only the fields you ask for (`fiel
 - **extras:** `settings` (engine, resolution, frames, camera, HDRI, units) and `collections`
 
 `query="chair"` filters by name and `root="Name"` lists a hierarchy, indented.
+
+### `get_node_tree`
+
+Read-only view of a node tree, so Claude can explain a material or a Geometry Nodes setup, or find what is disconnected,
+before changing it. Building and editing nodes is done with `execute_blender_code` (Python, `bpy`).
+
+| `kind` | reads | `name` / `object_name` |
+|---|---|---|
+| `material` | a material's shader nodes | `name`, or `object_name` for all materials of an object |
+| `geometry_nodes` | the Geometry Nodes modifier(s) of an object, with the values set on them | `object_name` (required), `name` to pick a modifier or group |
+| `node_group` | any node group in the file | `name` |
+| `world`, `compositor` | the world's nodes, or the scene's compositor | optional world or scene name |
+
+Leave `name` empty (material, node_group, geometry_nodes) to list what exists. The reply lists the nodes in data-flow order,
+then the links as `Node.Socket -> Node.Socket`. To stay short it shows only what differs from a new node of that type
+(settings in `[brackets]`, unconnected input values); sockets with the same name are written `Value[0]`, `Value[1]`; node
+groups and modifiers also show their interface with defaults and ranges. `recurse_groups` reads the groups used inside, and
+`max_nodes` caps the nodes shown per tree. To learn each node's defaults it briefly creates a scratch node group and removes
+it again.
 
 ### `look`
 

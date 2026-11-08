@@ -19,6 +19,7 @@ Blender as MCP tools. The add-on only runs code and takes screenshots; everythin
 access and API keys, lives here. What this server provides:
 
   * get_scene_info: compact text facts about the scene, with mesh/rig "health" checks and ground contact
+  * get_node_tree: read a shader, Geometry Nodes, world or compositor node tree (nodes, settings, links)
   * look: the live viewport, the scene camera, auto-framed multi-angle views and animation strips as images,
     so the model can *see* its work (Workbench renders through temporary cameras)
   * search_assets / import_asset: Poly Haven, Sketchfab and Poly Pizza behind one pair of tools, with
@@ -443,7 +444,8 @@ Controls a running Blender through the BlenderMCP add-on (the user must have cli
 
 Working method:
 1. Look before you edit: get_scene_info for the overview (add fields, or query / root, for detail) and
-   get_object_details for what you will touch.
+   get_object_details for what you will touch. Before changing a material or Geometry Nodes setup you did not
+   make yourself, read it with get_node_tree.
 2. Work in small steps and verify visually after each meaningful change with look: mode 'angles' with
    shading 'clay' to judge form, 'viewport' to see what the user sees, 'camera' for the framed shot. Check
    mesh quality with get_scene_info fields=['health'] (n-gons, holes, unweighted vertices). Use render_image
@@ -1367,6 +1369,447 @@ async def get_object_details(
     animation, and type-specific data (mesh stats incl. evaluated triangle count, camera lens, light
     settings). If the name is wrong, similar names are suggested."""
     return _compact(await _query(SNIP_DETAILS, {"name": name}))
+
+
+# --------------------------------------------------------------------------- node trees
+#
+# Reading shader, geometry, world and compositor node trees. Creating and editing nodes is done with
+# execute_blender_code; this tool only reads. To report only what a user changed, it compares every node with a
+# freshly made node of the same type in a scratch node group, which is removed again before the snippet ends.
+
+SNIP_NODE_TREE = """
+KIND, NAME, OBJ = _P["kind"], _P["name"], _P["object"]
+MAX_NODES, RECURSE, MAX_TREES = int(_P["max_nodes"]), bool(_P["recurse"]), 8
+
+
+class Fail(Exception):
+    def __init__(self, msg, names=(), query=""):
+        super().__init__(msg)
+        self.names, self.query = list(names), (query or "").lower()
+
+
+def fmt(v):
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return round(v, 4)
+    if isinstance(v, bpy.types.ID):
+        return {"ref": v.name}
+    if isinstance(v, (set, frozenset)):
+        return sorted(v)
+    try:
+        return [fmt(x) for x in v]
+    except TypeError:
+        return str(v)
+
+
+BASE_PROPS = set(bpy.types.Node.bl_rna.properties.keys()) | {"inputs", "outputs", "internal_links", "dimensions"}
+PLAIN = {"FRAME", "REROUTE", "GROUP_INPUT", "GROUP_OUTPUT"}
+scratch, cache = {}, {}
+
+
+def settings(n):
+    out = {}
+    for p in n.bl_rna.properties:
+        pid = p.identifier
+        if pid in BASE_PROPS or pid.startswith("bl_") or p.is_readonly or p.type == "COLLECTION":
+            continue
+        try:
+            v = getattr(n, pid)
+        except Exception:
+            continue
+        if p.type == "POINTER":
+            if isinstance(v, bpy.types.ID):
+                out[pid] = {"ref": v.name}
+            continue
+        out[pid] = fmt(v)
+    cr = getattr(n, "color_ramp", None)
+    if cr is not None:
+        out["color_ramp"] = {"interpolation": cr.interpolation, "stops": [[round(e.position, 4), fmt(e.color)] for e in cr.elements]}
+    return out
+
+
+def defaults_for(tree, n):
+    key = (tree.bl_idname, n.bl_idname)
+    if key not in cache:
+        res = None
+        try:
+            sg = scratch.get(tree.bl_idname)
+            if sg is None:
+                sg = scratch[tree.bl_idname] = bpy.data.node_groups.new("_mcp_scratch", tree.bl_idname)
+            tmp = sg.nodes.new(n.bl_idname)
+            res = ({s.identifier: fmt(s.default_value) for s in tmp.inputs if hasattr(s, "default_value")}, settings(tmp))
+            sg.nodes.remove(tmp)
+        except Exception:
+            res = None
+        cache[key] = res
+    return cache[key]
+
+
+def group_defaults(n):
+    gt = getattr(n, "node_tree", None)
+    if gt is None:
+        return {}
+    return {i.identifier: fmt(i.default_value) for i in gt.interface.items_tree
+            if i.item_type == "SOCKET" and i.in_out == "INPUT" and hasattr(i, "default_value")}
+
+
+def sname(s):
+    side = s.node.outputs if s.is_output else s.node.inputs
+    same = [x for x in side if x.name == s.name and (x.enabled or x is s)]
+    return f"{s.name}[{same.index(s)}]" if len(same) > 1 else s.name
+
+
+def node_entry(tree, n):
+    e = {"name": n.name, "type": n.bl_label, "kind": n.type}
+    if n.label and n.label != n.name:
+        e["label"] = n.label
+    if n.mute:
+        e["muted"] = True
+    if n.parent:
+        e["parent"] = n.parent.name
+    if n.type in PLAIN:
+        return e
+    is_group = n.type == "GROUP"
+    if is_group and n.node_tree:
+        e["group"] = n.node_tree.name
+    dflt = defaults_for(tree, n)
+    base_inputs, base_settings = dflt if dflt else ({}, {})
+    if is_group:
+        base_inputs = group_defaults(n)
+    st = {}
+    for k, v in settings(n).items():
+        if is_group and k == "node_tree":
+            continue
+        if k == "color_ramp" or (dflt and base_settings.get(k) != v) or (not dflt and v not in (None, False, 0, "")):
+            st[k] = v
+    if st:
+        e["settings"] = st
+    vals = {}
+    for s in n.inputs:
+        if s.is_linked or not s.enabled or s.type in ("GEOMETRY", "SHADER", "CUSTOM") or not hasattr(s, "default_value"):
+            continue
+        v = fmt(s.default_value)
+        if s.identifier in base_inputs and base_inputs[s.identifier] == v:
+            continue
+        if not base_inputs and v in (None, False, 0, 0.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]):
+            continue
+        vals[sname(s)] = v
+    if vals:
+        e["inputs"] = vals
+    return e
+
+
+def ordered(nodes, links):
+    indeg = {n.name: 0 for n in nodes}
+    out = {n.name: [] for n in nodes}
+    for l in links:
+        a, b = l.from_node.name, l.to_node.name
+        if a in indeg and b in indeg and a != b:
+            indeg[b] += 1
+            out[a].append(b)
+    by = {n.name: n for n in nodes}
+    key = lambda name: (round(by[name].location.x), -round(by[name].location.y), name)
+    ready = sorted((k for k, v in indeg.items() if v == 0), key=key)
+    result = []
+    while ready:
+        cur = ready.pop(0)
+        result.append(cur)
+        for nxt in out[cur]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                ready.append(nxt)
+        ready.sort(key=key)
+    rest = sorted((k for k in indeg if k not in result), key=key)
+    return [by[k] for k in result + rest]
+
+
+def interface_of(tree):
+    items = []
+    for i in tree.interface.items_tree:
+        if i.item_type != "SOCKET":
+            continue
+        d = {"name": i.name, "id": i.identifier, "dir": i.in_out, "type": i.socket_type}
+        if hasattr(i, "default_value"):
+            d["default"] = fmt(i.default_value)
+        for a in ("min_value", "max_value"):
+            if hasattr(i, a):
+                d[a] = fmt(getattr(i, a))
+        items.append(d)
+    return items
+
+
+def modifier_values(mod, tree):
+    vals = []
+    for i in tree.interface.items_tree:
+        if i.item_type != "SOCKET" or i.in_out != "INPUT" or i.socket_type in ("NodeSocketGeometry", "NodeSocketShader"):
+            continue
+        found, val = False, fmt(getattr(i, "default_value", None))
+        try:
+            g = mod.properties.inputs[i.identifier]
+            if "value" in g.keys():
+                found, val = True, fmt(g["value"])
+        except Exception:
+            try:
+                found, val = True, fmt(mod[i.identifier])
+            except Exception:
+                pass
+        vals.append({"name": i.name, "value": val, "changed": found})
+    return vals
+
+
+def describe(tree, title, extra=None):
+    if tree is None:
+        return {"title": title, "empty": True}
+    nodes = list(tree.nodes)
+    shown = ordered(nodes, tree.links)[:MAX_NODES]
+    names = {n.name for n in shown}
+    d = {"title": title, "tree_type": tree.bl_idname, "total_nodes": len(nodes), "total_links": len(tree.links),
+         "nodes": [node_entry(tree, n) for n in shown], "links": []}
+    for l in tree.links:
+        if l.from_node.name in names and l.to_node.name in names:
+            flag = "invalid" if not l.is_valid else ("muted" if l.is_muted else "")
+            d["links"].append([l.from_node.name, sname(l.from_socket), l.to_node.name, sname(l.to_socket), flag])
+    iface = interface_of(tree)
+    if iface:
+        d["interface"] = iface
+    d["groups"] = sorted({n.node_tree.name for n in nodes if n.type == "GROUP" and n.node_tree})
+    if extra:
+        d.update(extra)
+    return d
+
+
+def listing():
+    if KIND == "material":
+        items = [{"name": m.name, "nodes": len(m.node_tree.nodes), "users": m.users} for m in bpy.data.materials if m.node_tree]
+    elif KIND == "node_group":
+        items = [{"name": g.name, "type": g.bl_idname, "nodes": len(g.nodes), "users": g.users} for g in bpy.data.node_groups]
+    else:
+        items = [{"object": o.name, "modifiers": [{"name": m.name, "group": m.node_group.name if m.node_group else None}
+                                                  for m in o.modifiers if m.type == "NODES"]}
+                 for o in bpy.data.objects if any(m.type == "NODES" for m in o.modifiers)]
+    return {"list": KIND, "items": items[:100], "more": max(0, len(items) - 100)}
+
+
+def collect():
+    sc = bpy.context.scene
+    todo = []  # (tree or None, title, extra)
+    if KIND == "material":
+        if OBJ:
+            ob = bpy.data.objects.get(OBJ)
+            if ob is None:
+                raise Fail("Object not found: " + OBJ, bpy.data.objects.keys(), OBJ)
+            mats = []
+            for s in ob.material_slots:
+                if s.material and s.material not in mats:
+                    mats.append(s.material)
+            if NAME:
+                mats = [m for m in mats if m.name == NAME]
+                if not mats:
+                    raise Fail(f"Object {OBJ} has no material named {NAME}", [s.material.name for s in ob.material_slots if s.material], NAME)
+            if not mats:
+                raise Fail(f"Object {OBJ} has no materials")
+        else:
+            m = bpy.data.materials.get(NAME)
+            if m is None:
+                raise Fail("Material not found: " + NAME, bpy.data.materials.keys(), NAME)
+            mats = [m]
+        todo = [(m.node_tree, f'Material "{m.name}"', None) for m in mats[:4]]
+    elif KIND == "node_group":
+        if not NAME:
+            raise Fail("kind node_group needs name (leave it empty to list the node groups)")
+        g = bpy.data.node_groups.get(NAME)
+        if g is None:
+            raise Fail("Node group not found: " + NAME, bpy.data.node_groups.keys(), NAME)
+        todo = [(g, f'Node group "{g.name}"', None)]
+    elif KIND == "geometry_nodes":
+        ob = bpy.data.objects.get(OBJ)
+        if ob is None:
+            raise Fail("Object not found: " + OBJ, bpy.data.objects.keys(), OBJ)
+        mods = [m for m in ob.modifiers if m.type == "NODES"]
+        if NAME:
+            mods = [m for m in mods if m.name == NAME or (m.node_group and m.node_group.name == NAME)]
+        if not mods:
+            raise Fail(f"Object {OBJ} has no Geometry Nodes modifier" + (f" matching {NAME}" if NAME else ""),
+                       [m.name for m in ob.modifiers if m.type == "NODES"], NAME)
+        for m in mods[:4]:
+            todo.append((m.node_group, f'Geometry Nodes modifier "{m.name}" on {ob.name}',
+                         {"modifier_values": modifier_values(m, m.node_group)} if m.node_group else None))
+    elif KIND == "world":
+        w = bpy.data.worlds.get(NAME) if NAME else sc.world
+        if w is None:
+            raise Fail(("World not found: " + NAME) if NAME else "The scene has no world", bpy.data.worlds.keys(), NAME)
+        todo = [(w.node_tree, f'World "{w.name}"', None)]
+    elif KIND == "compositor":
+        s2 = bpy.data.scenes.get(NAME) if NAME else sc
+        if s2 is None:
+            raise Fail("Scene not found: " + NAME, bpy.data.scenes.keys(), NAME)
+        tree = getattr(s2, "compositing_node_group", None)
+        if tree is None and getattr(s2, "use_nodes", False):
+            tree = getattr(s2, "node_tree", None)
+        todo = [(tree, f'Compositor of scene "{s2.name}"', None)]
+    results, seen = [], set()
+    for tree, title, extra in todo:
+        results.append(describe(tree, title, extra))
+        if tree is not None:
+            seen.add(tree.name)
+    skipped = 0
+    if RECURSE:
+        queue = [g for r in results for g in r.get("groups", [])]
+        while queue:
+            g = queue.pop(0)
+            if g in seen:
+                continue
+            seen.add(g)
+            if len(results) >= MAX_TREES:
+                skipped += 1
+                continue
+            gt = bpy.data.node_groups.get(g)
+            if gt is not None:
+                r = describe(gt, f'Node group "{g}" (used inside)')
+                results.append(r)
+                queue.extend(r["groups"])
+    return {"trees": results, "groups_not_expanded": skipped}
+
+
+def main():
+    try:
+        if not NAME and not OBJ and KIND in ("material", "node_group"):
+            res = listing()
+        elif KIND == "geometry_nodes" and not OBJ:
+            res = listing()
+        else:
+            res = collect()
+        print(json.dumps(res, default=str))
+    except Fail as f:
+        print(json.dumps({"error": str(f), "similar": [n for n in f.names if f.query and f.query in n.lower()][:10] or f.names[:10]}))
+    finally:
+        for g in scratch.values():
+            try:
+                bpy.data.node_groups.remove(g)
+            except Exception:
+                pass
+
+
+main()
+"""
+
+
+def _nv(v: Any) -> str:
+    """One value from a node tree as text."""
+    if isinstance(v, dict) and "ref" in v:
+        return f"<{v['ref']}>"
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, (int, float)):
+        return _num(v)
+    if isinstance(v, list):
+        return "(" + ", ".join(_nv(x) for x in v) + ")"
+    return str(v)
+
+
+def _format_node(n: dict) -> str:
+    name = n["name"]
+    base = re.sub(r"\.\d{3}$", "", name)
+    head = name if base == n["type"] or n["kind"] in ("FRAME", "REROUTE") else f"{name} ({n['type']})"
+    if n.get("label"):
+        head += f' "{n["label"]}"'
+    bits = [head]
+    if n.get("group"):
+        bits.append(f"group=<{n['group']}>")
+    if n.get("muted"):
+        bits.append("MUTED")
+    if n.get("parent"):
+        bits.append(f"in {n['parent']}")
+    st = dict(n.get("settings") or {})
+    ramp = st.pop("color_ramp", None)
+    if ramp:
+        st["interpolation"] = ramp["interpolation"]
+    if st:
+        bits.append("[" + ", ".join(f"{k}={_nv(v)}" for k, v in st.items()) + "]")
+    if ramp:
+        bits.append("stops " + " ".join(f"{_nv(p)}:{_nv(c)}" for p, c in ramp["stops"]))
+    if n.get("inputs"):
+        bits.append(" ".join(f"{k}={_nv(v)}" for k, v in n["inputs"].items()))
+    return "  ".join(bits)
+
+
+def _format_node_trees(data: dict) -> str:
+    if "list" in data:
+        kind, items = data["list"], data["items"]
+        if not items:
+            return f"No {kind.replace('_', ' ')} trees in this file."
+        lines = []
+        for it in items:
+            if "object" in it:
+                lines.append(f"{it['object']}: " + ", ".join(f"{m['name']} -> {m['group']}" for m in it["modifiers"]))
+            elif "type" in it:
+                lines.append(f"{it['name']} [{it['type']}] {it['nodes']} nodes, {it['users']} users")
+            else:
+                lines.append(f"{it['name']} {it['nodes']} nodes, {it['users']} users")
+        more = f"\n... and {data['more']} more" if data.get("more") else ""
+        return f"Available ({kind.replace('_', ' ')}); pass one as name (or object_name):\n" + "\n".join(lines) + more
+    blocks = []
+    for t in data["trees"]:
+        if t.get("empty"):
+            blocks.append(f"{t['title']}: no node tree (it does not use nodes).")
+            continue
+        head = f"{t['title']} - {t['total_nodes']} nodes, {t['total_links']} links ({t['tree_type']})"
+        lines = [head]
+        iface = t.get("interface")
+        if iface:
+            for direction, label in (("INPUT", "Inputs"), ("OUTPUT", "Outputs")):
+                parts = []
+                for i in (x for x in iface if x["dir"] == direction):
+                    detail = [i["type"].replace("NodeSocket", "")]
+                    if "default" in i and i["default"] is not None and direction == "INPUT":
+                        detail.append(f"default {_nv(i['default'])}")
+                    lo, hi = i.get("min_value"), i.get("max_value")
+                    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and abs(lo) < 1e6 and abs(hi) < 1e6:
+                        detail.append(f"range {_nv(lo)}..{_nv(hi)}")
+                    parts.append(f"{i['name']} ({', '.join(detail)})")
+                if parts:
+                    lines.append(f"{label}: " + "; ".join(parts))
+        if t.get("modifier_values"):
+            lines.append("Modifier values: " + ", ".join(f"{v['name']}={_nv(v['value'])}" for v in t["modifier_values"]))
+        lines.append("Nodes (inputs first; [..] = node settings; the rest are unconnected input values that differ from the node's defaults):")
+        lines += ["  " + _format_node(n) for n in t["nodes"]]
+        if t["total_nodes"] > len(t["nodes"]):
+            lines.append(f"  ... {t['total_nodes'] - len(t['nodes'])} more nodes not shown (raise max_nodes)")
+        if t["links"]:
+            lines.append("Links:")
+            for fn, fs, tn, ts, flag in t["links"]:
+                lines.append(f"  {fn}.{fs} -> {tn}.{ts}" + (f"  ({flag})" if flag else ""))
+        if t.get("groups"):
+            lines.append("Uses node groups: " + ", ".join(t["groups"]))
+        blocks.append("\n".join(lines))
+    if data.get("groups_not_expanded"):
+        blocks.append(f"({data['groups_not_expanded']} more node groups not expanded)")
+    return "\n\n".join(blocks)
+
+
+@_tool(read_only=True)
+async def get_node_tree(
+    kind: Annotated[Literal["material", "geometry_nodes", "node_group", "world", "compositor"],
+                    Field(description="Which node tree to read")],
+    name: Annotated[Optional[str], Field(description="material / node_group: its name. geometry_nodes: the modifier or group name (default: all Nodes modifiers of the object). world / compositor: world or scene name (default: the active scene's). Leave empty with kind material, node_group or geometry_nodes to list what exists")] = None,
+    object_name: Annotated[Optional[str], Field(description="material: read the materials of this object. geometry_nodes: the object that has the modifier (required)")] = None,
+    recurse_groups: Annotated[bool, Field(description="Also read the node groups used inside (up to 8 trees in total)")] = False,
+    max_nodes: Annotated[int, Field(ge=1, le=500, description="Maximum nodes shown per tree")] = 80,
+) -> str:
+    """Read a node tree (read-only): what nodes it has, their settings, and how they are connected. Use it
+    before changing a material or Geometry Nodes setup you did not build in this conversation, to explain one,
+    or to find what is disconnected. Create and edit nodes with execute_blender_code.
+
+    Output: nodes in data-flow order (inputs first), then the links as `Node.Socket -> Node.Socket`. Only what
+    differs from a new node of that type is listed: settings in [brackets] and unconnected input values.
+    Sockets with the same name on one node are written Name[0], Name[1]. For a node group (and a Geometry
+    Nodes modifier) the interface is listed with defaults and ranges; a modifier also shows the values set
+    on it. Reading briefly makes a scratch node group to learn each node's defaults and removes it at once."""
+    if kind == "geometry_nodes" and not object_name and name:
+        raise ToolError("kind geometry_nodes needs object_name (leave both empty to list the objects that have one)")
+    return _clip(_format_node_trees(await _query(
+        SNIP_NODE_TREE, dict(kind=kind, name=name, object=object_name, recurse=recurse_groups, max_nodes=max_nodes))))
 
 
 # --------------------------------------------------------------------------- look

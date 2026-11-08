@@ -204,6 +204,128 @@ async def main():
     check("get_object_details on real Blender", d["modifiers"][0]["type"] == "BEVEL"
           and d["materials"][0]["name"] == "CrateMat" and d["mesh"]["faces"] == 6 and d["world_bbox"]["max"] == [1, 1, 2], d)
 
+    # ------------------------------------------------------------------ get_node_tree
+    groups_before, mats_before = sorted(bpy.data.node_groups.keys()), sorted(bpy.data.materials.keys())
+    tmesh = bpy.data.meshes.new("NT_Mesh")
+    tobj = bpy.data.objects.new("NT_Obj", tmesh)
+    bpy.context.scene.collection.objects.link(tobj)
+
+    listing = await S.get_node_tree(kind="material")
+    check("get_node_tree lists the materials that use nodes", "CrateMat" in listing and "Available (material)" in listing, listing)
+    out = await S.get_node_tree(kind="material", name="CrateMat")
+    check("get_node_tree: material nodes, a changed value and the links",
+          "Principled BSDF" in out and "Material Output" in out and "Base Color=(0.8, 0.2, 0.1, 1)" in out
+          and "Principled BSDF.BSDF -> Material Output.Surface" in out, out)
+    check("get_node_tree: unchanged inputs are left out", "Metallic=" not in out and "IOR=" not in out, out)
+    out = await S.get_node_tree(kind="material", object_name="Crate")
+    check("get_node_tree: materials of an object", 'Material "CrateMat"' in out, out)
+
+    mat = bpy.data.materials.new("NT_Mat")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 7.0
+    noise.noise_dimensions = "4D"
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position = 0.3
+    math_node = nt.nodes.new("ShaderNodeMath")
+    math_node.operation = "MULTIPLY"
+    math_node.inputs[1].default_value = 2.5
+    muted = nt.nodes.new("ShaderNodeMapping")
+    muted.mute = True
+    muted.label = "Skewed"
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    nt.links.new(noise.outputs[0], math_node.inputs[0])
+    nt.links.new(math_node.outputs[0], ramp.inputs[0])
+    nt.links.new(ramp.outputs[0], bsdf.inputs["Base Color"])
+    out = await S.get_node_tree(kind="material", name="NT_Mat")
+    check("get_node_tree: node settings and values that differ from the defaults",
+          "Scale=7" in out and "noise_dimensions=4D" in out and "operation=MULTIPLY" in out and "Value[1]=2.5" in out
+          and "stops 0.3:(0, 0, 0, 1)" in out, out)
+    check("get_node_tree: same-named sockets are told apart", "Math.Value[0]" in out or "Value[0]" in out, out)
+    check("get_node_tree: muted node and label", "MUTED" in out and '"Skewed"' in out, out)
+    check("get_node_tree: data-flow order (the noise before the ramp before the BSDF)",
+          out.index("Noise Texture") < out.index("Color Ramp") < out.index("Principled BSDF"), out)
+    out = await S.get_node_tree(kind="material", name="NT_Mat", max_nodes=2)
+    check("get_node_tree: max_nodes truncates and says so", "more nodes not shown" in out and out.count("\n  ") < 12, out)
+
+    inner = bpy.data.node_groups.new("NT_Inner", "GeometryNodeTree")
+    inner.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    inner.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    ig_in, ig_out = inner.nodes.new("NodeGroupInput"), inner.nodes.new("NodeGroupOutput")
+    flip = inner.nodes.new("GeometryNodeFlipFaces")
+    inner.links.new(ig_in.outputs[0], flip.inputs[0])
+    inner.links.new(flip.outputs[0], ig_out.inputs[0])
+    gn = bpy.data.node_groups.new("NT_Scatter", "GeometryNodeTree")
+    gn.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    dens = gn.interface.new_socket("Density", in_out="INPUT", socket_type="NodeSocketFloat")
+    dens.default_value, dens.min_value, dens.max_value = 6.0, 0.0, 100.0
+    gn.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    gi, go = gn.nodes.new("NodeGroupInput"), gn.nodes.new("NodeGroupOutput")
+    sub = gn.nodes.new("GeometryNodeGroup")
+    sub.node_tree = inner
+    dist = gn.nodes.new("GeometryNodeDistributePointsOnFaces")
+    gn.links.new(gi.outputs["Geometry"], sub.inputs[0])
+    gn.links.new(sub.outputs[0], dist.inputs["Mesh"])
+    gn.links.new(gi.outputs["Density"], dist.inputs["Density"])
+    gn.links.new(dist.outputs["Points"], go.inputs[0])
+    gmod = tobj.modifiers.new("Scatter", "NODES")
+    gmod.node_group = gn
+    ident = next(i.identifier for i in gn.interface.items_tree if i.name == "Density" and i.in_out == "INPUT")
+    try:
+        gmod.properties.inputs[ident]["value"] = 12.0
+    except Exception:
+        gmod[ident] = 12.0
+    out = await S.get_node_tree(kind="geometry_nodes", object_name="NT_Obj")
+    check("get_node_tree: Geometry Nodes interface, modifier values, links and nested group",
+          "Density (Float, default 6, range 0..100)" in out and "Modifier values: Density=12" in out
+          and "Group Input.Density -> Distribute Points on Faces.Density" in out and "group=<NT_Inner>" in out
+          and "Uses node groups: NT_Inner" in out and "Flip Faces" not in out, out)
+    out = await S.get_node_tree(kind="geometry_nodes", object_name="NT_Obj", name="NT_Scatter", recurse_groups=True)
+    check("get_node_tree: recurse_groups also reads the nested group", 'Node group "NT_Inner" (used inside)' in out
+          and "Flip Faces" in out, out)
+    out = await S.get_node_tree(kind="node_group", name="NT_Inner")
+    check("get_node_tree: a node group by name", "Flip Faces" in out and "Group Input.Geometry -> Flip Faces.Mesh" in out, out)
+    check("get_node_tree: lists Geometry Nodes objects and node groups",
+          "NT_Obj: Scatter -> NT_Scatter" in await S.get_node_tree(kind="geometry_nodes")
+          and "NT_Scatter [GeometryNodeTree]" in await S.get_node_tree(kind="node_group"))
+
+    r = await raises(S.get_node_tree(kind="material", name="NT_Mt"), "Material not found: NT_Mt", "NT_Mat")
+    check("get_node_tree: wrong material name suggests similar ones", r[0], r[1])
+    r = await raises(S.get_node_tree(kind="geometry_nodes", object_name="Crate"), "no Geometry Nodes modifier")
+    check("get_node_tree: object without a Geometry Nodes modifier", r[0], r[1])
+    r = await raises(S.get_node_tree(kind="geometry_nodes", name="NT_Scatter"), "needs object_name")
+    check("get_node_tree: geometry_nodes with a name but no object", r[0], r[1])
+    r = await raises(S.get_node_tree(kind="node_group", object_name="NT_Obj", name="Nope"), "Node group not found")
+    check("get_node_tree: unknown node group", r[0], r[1])
+    r = await raises(S.get_node_tree(kind="world"), "no world")
+    check("get_node_tree: scene without a world", r[0], r[1])
+    world = bpy.data.worlds.new("NT_World")
+    world.use_nodes = True
+    bpy.context.scene.world = world
+    out = await S.get_node_tree(kind="world")
+    check("get_node_tree: world nodes", 'World "NT_World"' in out and "Background" in out and "World Output" in out, out)
+    out = await S.get_node_tree(kind="compositor")
+    check("get_node_tree: scene without a compositor tree says so", "no node tree" in out, out)
+    mat_plain = bpy.data.materials.new("NT_Plain")
+    mat_plain.use_nodes = False
+    if mat_plain.node_tree is None:
+        out = await S.get_node_tree(kind="material", name="NT_Plain")
+        check("get_node_tree: material without nodes", "no node tree" in out, out)
+
+    check("get_node_tree changed nothing and left no scratch data behind",
+          sorted(bpy.data.node_groups.keys()) == sorted(groups_before + ["NT_Inner", "NT_Scatter"])
+          and sorted(bpy.data.materials.keys()) == sorted(mats_before + ["NT_Mat", "NT_Plain"])
+          and not any(k.startswith("_mcp_scratch") for k in bpy.data.node_groups.keys())
+          and tobj.modifiers["Scatter"].node_group == gn, (list(bpy.data.node_groups.keys()), list(bpy.data.materials.keys())))
+
+    bpy.context.scene.world = None
+    for coll, names in ((bpy.data.objects, ["NT_Obj"]), (bpy.data.meshes, ["NT_Mesh"]), (bpy.data.node_groups, ["NT_Scatter", "NT_Inner"]),
+                        (bpy.data.materials, ["NT_Mat", "NT_Plain"]), (bpy.data.worlds, ["NT_World"])):
+        for nm in names:
+            coll.remove(coll[nm])
+
     # ------------------------------------------------------------------ look
     rs = sc.render
     before = (rs.engine, rs.resolution_x, rs.resolution_y, rs.filepath, sc.camera.name, sc.frame_current,
@@ -307,7 +429,7 @@ async def main():
     S3 = h.load_server(port, BLENDER_MCP_READONLY=1)
     names = {t.name for t in await S3.mcp.list_tools()}
     check("read-only keeps looking and reading, hides writing",
-          {"get_scene_info", "look", "get_object_details", "search_assets", "blender_status"} <= names
+          {"get_scene_info", "look", "get_object_details", "get_node_tree", "search_assets", "blender_status"} <= names
           and not ({"execute_blender_code", "run_blender_script", "import_asset", "save_blend", "render_image"} & names), sorted(names))
 
     srv.stop()

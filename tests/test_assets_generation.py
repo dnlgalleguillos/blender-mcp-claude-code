@@ -544,7 +544,7 @@ async def main():
         base = {k: v for k, v in os.environ.items() if not k.startswith(("BLENDER_", "POLYPIZZA_", "SKETCHFAB_", "HYPER3D_", "HUNYUAN3D_"))}
         return StdioServerParameters(command=sys.executable, args=[server_py], env={**base, "BLENDER_PORT": str(PORT), **env})
 
-    expected = {"blender_status", "get_scene_info", "get_object_details", "look", "render_image", "execute_blender_code",
+    expected = {"blender_status", "get_scene_info", "get_object_details", "get_node_tree", "look", "render_image", "execute_blender_code",
                 "run_blender_script", "save_blend", "export_scene", "search_assets", "import_asset", "rodin_generate",
                 "hunyuan3d_generate", "collect_generated_model"}
     async with stdio_client(params(SKETCHFAB_API_KEY="sk-secret-value", HUNYUAN3D_API_URL="http://localhost:8081")) as (rd, wr):
