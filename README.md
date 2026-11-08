@@ -187,9 +187,6 @@ event loop.
 Free software under the **GNU General Public License, version 3 or (at your option) any later version**, see [`LICENSE`](LICENSE).
 Copyright (C) 2026 Daniel Galleguillos Cruz.
 
-Versions 1.x of this repository (see the git history) were a modified copy of the add-on from
-[ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) (© 2025 Siddharth Ahuja, MIT License), whose notice those
-versions carried. Version 2 replaces it entirely: the add-on and the server are new code. The design owes ideas to that
-project, now called [mcp-for-blender](https://github.com/ahujasid/mcp-for-blender): multi-view `look`, mesh health in the
-scene summary, one search/import pair for several asset libraries and an opt-in safe mode. They are reimplemented here,
-without its telemetry or promotional text.
+The design owes ideas to [mcp-for-blender](https://github.com/ahujasid/mcp-for-blender) (formerly blender-mcp): multi-view
+`look`, mesh health in the scene summary, one search/import pair for several asset libraries and an opt-in safe mode. They
+are reimplemented here, without its telemetry or promotional text.
