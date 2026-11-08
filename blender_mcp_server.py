@@ -14,7 +14,7 @@
 """
 Blender MCP server 2.0, designed for Claude Code and Daniel Galleguillos Cruz.
 
-Speaks the TCP/JSON protocol of the BlenderMCP add-on (blender_mcp.py 1.3.1 or the stock add-on) and exposes
+Speaks the TCP/JSON protocol of the BlenderMCP add-on (blender_mcp.py 1.3.2 or the stock add-on) and exposes
 it as MCP tools. What it adds over a thin "execute code" bridge:
 
   * get_scene_info: compact text facts about the scene, with mesh/rig "health" checks and ground contact

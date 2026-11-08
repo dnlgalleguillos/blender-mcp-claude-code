@@ -6,12 +6,16 @@
 #
 # Modified version (1.3). Changes vs. 1.2:
 #  - Removed the handler that deleted the object named "Cube" on every file load
-#  - Telemetry consent is now opt-in (default off)
+#  - Telemetry consent is now opt-in (default off); removed entirely in 1.3.2
 #  - Optional shared-token authentication for the socket
 #  - Panel switch to disable execute_code; undo step + bmesh/math/mathutils in its namespace
 #  - Default timeout on every HTTP request
 #  - Robust message framing (several/partial JSON messages per recv)
 #  - Proper logging, no bare excepts, start-up errors reported in the UI
+# 1.3.2:
+#  - Privacy text corrected: this add-on never collects or sends telemetry, whatever the old setting says.
+#    The "Allow Telemetry" checkbox and the link to the original project's terms are gone from the UI, and
+#    get_telemetry_consent always answers False, so a server that asks never turns collection on.
 # 1.3.1:
 #  - Hunyuan3D local generation: long read timeout (it is one synchronous request that can take minutes)
 #  - Rodin images: [suffix, base64] items are sent as real image bytes (hyper3d.ai) or data URIs (fal.ai);
@@ -46,7 +50,7 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 3, 1),
+    "version": (1, 3, 2),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -1183,19 +1187,9 @@ class BlenderMCPServer:
             return {"error": f"Failed to apply texture: {str(e)}"}
 
     def get_telemetry_consent(self):
-        """Get the current telemetry consent status"""
-        try:
-            # Get addon preferences - use the module name
-            addon_prefs = bpy.context.preferences.addons.get(__name__)
-            if addon_prefs:
-                consent = addon_prefs.preferences.telemetry_consent
-            else:
-                # Fallback to default if preferences not available
-                consent = False
-        except (AttributeError, KeyError):
-            # Fallback to default if preferences not available
-            consent = False
-        return {"consent": consent}
+        """Telemetry consent. This add-on collects nothing, so the answer is always False; it is still answered
+        because servers written for the original add-on ask for it, and they must never be told to collect."""
+        return {"consent": False}
 
     def get_polyhaven_status(self):
         """Get the current status of PolyHaven integration"""
@@ -2422,8 +2416,8 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
     
     telemetry_consent: BoolProperty(
-        name="Allow Telemetry",
-        description="Allow collection of prompts, code snippets, and screenshots to help improve Blender MCP",
+        name="Allow Telemetry (unused)",
+        description="Not used: this add-on never collects or sends telemetry. Kept so older preference files still load",
         default=False
     )
 
@@ -2447,27 +2441,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         sec.label(text="If set, the MCP server must send it as \"token\" in every command.", icon='BLANK1')
         sec.label(text="Takes effect the next time you press Connect.", icon='BLANK1')
 
-        # Telemetry section
-        layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
-        
+        # Privacy section
+        layout.label(text="Privacy:", icon='PREFERENCES')
         box = layout.box()
-        row = box.row()
-        row.prop(self, "telemetry_consent", text="Allow Telemetry")
-        
-        # Info text
-        box.separator()
-        if self.telemetry_consent:
-            box.label(text="With consent: We collect anonymized prompts, code, and screenshots.", icon='INFO')
-        else:
-            box.label(text="Without consent: We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
-        box.separator()
-        box.label(text="All data is fully anonymized. You can change this anytime.", icon='CHECKMARK')
-        
-        # Terms and Conditions link
-        box.separator()
-        row = box.row()
-        row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
+        box.label(text="This add-on does not collect or send telemetry, analytics or usage data.", icon='CHECKMARK')
+        box.label(text="It contacts a service only when you use it: Poly Haven, Sketchfab,", icon='INFO')
+        box.label(text="Hyper3D Rodin / fal.ai or Hunyuan3D. The add-on itself sends nothing else.", icon='BLANK1')
 
 # Blender UI Panel
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
@@ -2581,24 +2560,6 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 
         scene.blendermcp_server_running = False
 
-        return {'FINISHED'}
-
-# Operator to open Terms and Conditions
-class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
-    bl_idname = "blendermcp.open_terms"
-    bl_label = "View Terms and Conditions"
-    bl_description = "Open the Terms and Conditions document"
-
-    def execute(self, context):
-        # Open the Terms and Conditions on GitHub
-        terms_url = "https://github.com/ahujasid/blender-mcp/blob/main/TERMS_AND_CONDITIONS.md"
-        try:
-            import webbrowser
-            webbrowser.open(terms_url)
-            self.report({'INFO'}, "Terms and Conditions opened in browser")
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open Terms and Conditions: {str(e)}")
-        
         return {'FINISHED'}
 
 @persistent
@@ -2749,7 +2710,6 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_GenerateToken)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     bpy.app.handlers.load_post.append(_reset_server_flag)
 
@@ -2766,7 +2726,6 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_GenerateToken)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port

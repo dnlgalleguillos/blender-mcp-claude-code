@@ -4,7 +4,7 @@ Control Blender from Claude Code, and let Claude **see** what it builds. Two fil
 
 | File | Runs where | What it does |
 |---|---|---|
-| `blender_mcp.py` | Inside Blender (add-on, v1.3.1) | Opens a local socket and executes commands in Blender |
+| `blender_mcp.py` | Inside Blender (add-on, v1.3.2) | Opens a local socket and executes commands in Blender |
 | `blender_mcp_server.py` | Launched by Claude Code (v2.0) | MCP server: exposes the tools to Claude and talks to the add-on |
 
 ```
