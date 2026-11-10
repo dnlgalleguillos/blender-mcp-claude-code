@@ -236,6 +236,11 @@ async def main():
     muted.mute = True
     muted.label = "Skewed"
     bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    value_node = nt.nodes.new("ShaderNodeValue")
+    value_node.label = "Upper"
+    value_node.outputs[0].default_value = 0.6
+    rgb_node = nt.nodes.new("ShaderNodeRGB")
+    rgb_node.outputs[0].default_value = (0.2, 0.4, 0.8, 1.0)
     nt.links.new(noise.outputs[0], math_node.inputs[0])
     nt.links.new(math_node.outputs[0], ramp.inputs[0])
     nt.links.new(ramp.outputs[0], bsdf.inputs["Base Color"])
@@ -243,6 +248,8 @@ async def main():
     check("get_node_tree: node settings and values that differ from the defaults",
           "Scale=7" in out and "noise_dimensions=4D" in out and "operation=MULTIPLY" in out and "Value[1]=2.5" in out
           and "stops 0.3:(0, 0, 0, 1)" in out, out)
+    check("get_node_tree: Value and RGB nodes show their number and colour",
+          'Value "Upper"  Value=0.6' in out and "Color=(0.2, 0.4, 0.8, 1)" in out, out)
     check("get_node_tree: same-named sockets are told apart", "Math.Value[0]" in out or "Value[0]" in out, out)
     check("get_node_tree: muted node and label", "MUTED" in out and '"Skewed"' in out, out)
     check("get_node_tree: data-flow order (the noise before the ramp before the BSDF)",
@@ -354,6 +361,19 @@ async def main():
     check("solid shows the material's real base colour (red crate looks red)", solid[0] - solid[1] > 0.05, solid)
     check("clay is one neutral colour (no tint)", abs(clay[0] - clay[1]) < 0.01 and abs(clay[1] - clay[2]) < 0.01, clay)
     check("materials' viewport colours restored after look", tuple(crate_mat.diffuse_color) == grey_before, tuple(crate_mat.diffuse_color))
+
+    mods_before = {o.name: [(m.name, m.type) for m in o.modifiers] for o in bpy.data.objects}
+    faces_before = {o.name: len(o.data.polygons) for o in bpy.data.objects if o.type == "MESH"}
+    wire = await S.look(mode="angles", target=["Crate"], views=["front"], shading="wireframe", max_size=200)
+    check("wireframe: renders a PNG and says it was framed", len(wire) == 2 and png_size(wire[1].data) == (200, 200), wire[0])
+    wire_mean = png_mean_rgb(wire[1].data)
+    solid_200 = png_mean_rgb((await S.look(mode="angles", target=["Crate"], views=["front"], shading="solid", max_size=200))[1].data)
+    check("wireframe: thin edges, so it looks nothing like the solid crate", sum(abs(a - b) for a, b in zip(wire_mean, solid_200)) > 0.05, (wire_mean, solid_200))
+    check("wireframe: the temporary modifiers are removed and no mesh changed",
+          {o.name: [(m.name, m.type) for m in o.modifiers] for o in bpy.data.objects} == mods_before
+          and {o.name: len(o.data.polygons) for o in bpy.data.objects if o.type == "MESH"} == faces_before)
+    material = png_mean_rgb((await S.look(mode="angles", target=["Crate"], views=["front"], shading="material", max_size=200))[1].data)
+    check("shading 'material' is an alias of 'solid'", all(abs(a - b) < 0.01 for a, b in zip(material, solid_200)), (material, solid_200))
 
     res = await S.look(mode="camera", max_size=320)
     check("camera: scene camera at the render aspect (1920x1080 -> 320x180)", png_size(res[1].data) == (320, 180)

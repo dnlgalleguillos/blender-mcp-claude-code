@@ -212,8 +212,8 @@ async def main():
         check("polyhaven search: min_size_m keeps only large real-world tiles", tiles and min(tiles) >= 2.0, (len(tiles), out[:200]))
         check("polyhaven search: no match -> helpful text", "Try other words" in await S.search_assets(source="polyhaven", query="zzzzqqqq"))
         res = await S.search_assets(source="polyhaven", query="armchair", asset_type="models", previews=1)
-        check("polyhaven search: previews attach a real thumbnail (the CDN serves WebP)", isinstance(res, list) and len(res) == 2
-              and res[1].to_image_content().mimeType == "image/webp", [type(x).__name__ for x in res] if isinstance(res, list) else res)
+        check("polyhaven search: previews attach a real thumbnail (the CDN has served WebP, now PNG)", isinstance(res, list) and len(res) == 2
+              and res[1].to_image_content().mimeType in ("image/webp", "image/png", "image/jpeg"), [type(x).__name__ for x in res] if isinstance(res, list) else res)
 
     # everything below uses the simulated internet
     S._client_factory = factory

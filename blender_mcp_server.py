@@ -1495,6 +1495,8 @@ def node_entry(tree, n):
         if not base_inputs and v in (None, False, 0, 0.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]):
             continue
         vals[sname(s)] = v
+    if n.type in ("VALUE", "RGB"):  # these hold their number or colour on the output socket
+        vals["Value" if n.type == "VALUE" else "Color"] = fmt(n.outputs[0].default_value)
     if vals:
         e["inputs"] = vals
     return e
@@ -1825,7 +1827,7 @@ LOOK_VIEWS = {  # direction from the target towards the eye (Blender: Z up, fron
     "three_quarter": (1.0, -1.0, 0.8),
 }
 LOOK_DEFAULT_ANGLES = ["front", "right", "top", "three_quarter"]
-LOOK_SHADINGS = ("solid", "textured", "clay", "flat", "xray")
+LOOK_SHADINGS = ("solid", "material", "textured", "clay", "flat", "xray", "wireframe")  # "material" is an alias of "solid"
 LOOK_FOCAL_MM = 50.0
 LOOK_SENSOR_MM = 36.0
 LOOK_FIT_MARGIN = 1.15
@@ -1905,7 +1907,27 @@ SHADINGS = {
     "clay": {"light": "STUDIO", "color_type": "SINGLE", "show_xray": False},
     "flat": {"light": "FLAT", "color_type": "MATERIAL", "show_xray": False},
     "xray": {"light": "STUDIO", "color_type": "MATERIAL", "show_xray": True},
+    "wireframe": {"light": "STUDIO", "color_type": "MATERIAL", "show_xray": False},
 }
+
+def add_wireframes(saved_wires):
+    # The Workbench *render* ignores the viewport's wireframe mode and draws nothing, so a Wireframe modifier is added
+    # (replacing the surface, thickness ~0.6% of the object's size) to every visible mesh for the render, then removed.
+    # Objects with no mesh of their own (Geometry Nodes that only output instances) have nothing to show.
+    for o in scene.objects:
+        try:
+            if o.type != "MESH" or o.hide_render or not o.visible_get() or len(o.data.polygons) > 150000:
+                continue
+            size = max(o.dimensions)
+            if size <= 0:
+                continue
+            avg_scale = max(sum(abs(c) for c in o.scale) / 3.0, 1e-6)
+            m = o.modifiers.new("_mcp_look_wire", "WIREFRAME")
+            m.thickness = size * 0.006 / avg_scale
+            m.use_replace = True
+            saved_wires.append((o, m))
+        except Exception:
+            pass
 
 def sync_materials(saved_list):
     # Workbench colours surfaces with a material's *viewport display* colour, not its node tree, so a red
@@ -1929,7 +1951,7 @@ def sync_materials(saved_list):
             pass
 
 def build():
-    results, temps, saved_mats = [], [], []
+    results, temps, saved_mats, saved_wires = [], [], [], []
     orig_camera, orig_frame = scene.camera, scene.frame_current
     saved = {"engine": rs.engine, "pct": rs.resolution_percentage, "rx": rs.resolution_x, "ry": rs.resolution_y,
              "path": rs.filepath, "fmt": rs.image_settings.file_format, "mode": rs.image_settings.color_mode}
@@ -1940,6 +1962,8 @@ def build():
         for k, v in SHADINGS[_P["shading"]].items():
             setattr(sh, k, v)
         sync_materials(saved_mats)
+        if _P["shading"] == "wireframe":
+            add_wireframes(saved_wires)
         rs.resolution_percentage = 100
         rs.resolution_x, rs.resolution_y = _P["resolution"]
         rs.image_settings.file_format = "PNG"
@@ -1983,6 +2007,11 @@ def build():
                 pass
             try:
                 bpy.data.cameras.remove(cd)
+            except Exception:
+                pass
+        for o, m in saved_wires:
+            try:
+                o.modifiers.remove(m)
             except Exception:
                 pass
         for mat, diffuse, active in saved_mats:
@@ -2110,7 +2139,7 @@ async def look(
     target: Annotated[Optional[list[str]], Field(description="Object names to frame (children included). Default: every visible object")] = None,
     views: Annotated[Optional[list[Union[str, list[float]]]], Field(description="angles: up to 6 of front, back, left, right, top, bottom, three_quarter, or [x, y, z] directions from the target towards the eye")] = None,
     distance: Annotated[Optional[float], Field(gt=0, description="Metres from the target's centre to the eye (default: far enough to fit it)")] = None,
-    shading: Annotated[Optional[Literal["solid", "textured", "clay", "flat", "xray"]], Field(description="How surfaces are drawn (not for mode viewport). Default solid")] = None,
+    shading: Annotated[Optional[Literal["solid", "material", "textured", "clay", "flat", "xray", "wireframe"]], Field(description="How surfaces are drawn (not for mode viewport). Default solid; material is an alias of solid")] = None,
     frames: Annotated[Optional[list[int]], Field(description="frames: explicit frame numbers (max 12)")] = None,
     frame_count: Annotated[int, Field(ge=2, le=12, description="frames: how many frames to sample across the animation")] = 6,
     view: Annotated[Optional[Union[str, list[float]]], Field(description="frames: 'camera', an angle name or an [x, y, z] direction. Default: the scene camera, else three_quarter")] = None,
@@ -2127,7 +2156,9 @@ async def look(
     - frames: the animation sampled over time, seen through `view`.
     The last three render with the Workbench engine through temporary cameras (removed afterwards, your
     settings are restored), which is quick and needs no lighting setup. shading: solid (default, your materials'
-    base colours), textured, clay (one neutral colour, best to judge form), flat (unlit), xray (see-through).
+    base colours; "material" is the same), textured, clay (one neutral colour, best to judge form), flat (unlit),
+    xray (see-through), wireframe (the mesh edges as thin bars, to check topology; objects whose geometry is
+    only instances from Geometry Nodes show nothing).
     For a fully shaded, lit result use render_image. Blender is busy while it renders."""
     if mode == "viewport":
         if shading or target or views or frames or view or distance:
@@ -2135,7 +2166,7 @@ async def look(
                             "view / distance only apply to the modes camera, angles and frames")
         note, images = await _look_viewport(max_size)
     else:
-        shading = shading or "solid"
+        shading = "solid" if shading in (None, "material") else shading
         need_bbox = mode in ("angles", "frames")
         info = await _query(SNIP_LOOK_TARGET, {"targets": target, "need_bbox": need_bbox})
         scene_res, cams, frame_list = info["resolution"], [], None
